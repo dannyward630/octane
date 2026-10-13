@@ -16638,25 +16638,31 @@ function ssrEmitTry(node, ctx, name, inlinedSubs, parentNs, cssHash, componentNs
 	// boundary registration + `<template data-oct-b>` sentinel). As React's server
 	// never runs an error boundary, the @catch arm is client-only: any other
 	// thrown error marks a @pending boundary for a client render, or rethrows.
+	// A catch-only boundary (handler but no @pending) propagates suspensions
+	// exactly like ErrorBoundary, so it never registers as a stream boundary
+	// whose later rejection would be silently recovered.
 	// Output is byte-identical to the old inline try/catch emit for buffered
 	// renders (hydration compatibility).
 	// `siteKey` is a stable source-position hash so a boundary keeps its identity
 	// across streaming passes (the runtime adds the frame path per instance).
+	const catchOnly =
+		node.handler && !node.propagateSuspense && pendFn.type === 'Literal' && pendFn.value === null;
+	const propagateSuspense = node.propagateSuspense === true || catchOnly;
 	const trailing = [];
 	// A presentation-binding view names its @try region on the boundary's own
 	// range; the arm suffix is appended by ssrTry once it knows what it rendered.
 	const bindingSite = node._octaneBindingSite
 		? inheritOriginLoc(b.literal(bindingMarker(node._octaneBindingSite, 'y')), node)
 		: null;
-	if (componentNs !== null || node.propagateSuspense === true || bindingSite !== null) {
+	if (componentNs !== null || propagateSuspense || bindingSite !== null) {
 		trailing.push(
 			componentNs === null
 				? inheritOriginLoc(b.id('undefined'), node)
 				: inheritOriginLoc(b.literal(componentNs, JSON.stringify(componentNs)), node),
 		);
 	}
-	if (node.propagateSuspense === true || bindingSite !== null) {
-		trailing.push(inheritOriginLoc(b.literal(node.propagateSuspense === true), node));
+	if (propagateSuspense || bindingSite !== null) {
+		trailing.push(inheritOriginLoc(b.literal(propagateSuspense), node));
 	}
 	if (bindingSite !== null) trailing.push(bindingSite);
 	return ssrCall(
