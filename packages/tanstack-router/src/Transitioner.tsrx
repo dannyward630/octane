@@ -55,42 +55,53 @@ export function useTransitioner() {
 		// Upstream guards this block with a dev-only `mounted` ref purely to absorb
 		// React's StrictMode double-invoke; keeping that ref here would instead skip
 		// the swapped-in router's load.
-		router.updateLatestLocation?.();
-		const location = router.latestLocation;
-		const nextLocation = router.buildLocation({
-			to: location.pathname,
-			search: true,
-			params: true,
-			hash: true,
-			state: true,
-			_includeValidateSearch: true,
-		} as any);
-		if (trimPathRight(location.publicHref) !== trimPathRight(nextLocation.publicHref)) {
-			router.commitLocation({ ...nextLocation, replace: true, ignoreBlocker: true });
-			return unsub;
-		}
+		const mount = () => {
+			router.updateLatestLocation?.();
+			const location = router.latestLocation;
+			const nextLocation = router.buildLocation({
+				to: location.pathname,
+				search: true,
+				params: true,
+				hash: true,
+				state: true,
+				_includeValidateSearch: true,
+			} as any);
+			if (trimPathRight(location.publicHref) !== trimPathRight(nextLocation.publicHref)) {
+				router.commitLocation({ ...nextLocation, replace: true, ignoreBlocker: true });
+				return;
+			}
 
-		const resolvedLocation = router.stores.resolvedLocation.get();
-		if (
-			resolvedLocation?.href === location.href &&
-			resolvedLocation.state.__TSR_key === location.state.__TSR_key
-		) {
-			// Already resolved (SSR hydration): emit `onRendered` for scroll
-			// restoration and devtools. The match tree has already committed by the
-			// time this layout effect runs (child effects fire before the parent's),
-			// so emit directly rather than through the acknowledgement/settle path:
-			// hydration acknowledges the matches already on screen, which — unlike a
-			// navigation that commits the *next* matches — triggers no re-render for
-			// `MatchesInner`'s settle effect to run on.
-			router.emit({
-				type: 'onRendered',
-				...getLocationChangeInfo(resolvedLocation, resolvedLocation),
-			});
-		} else if (!router._tx) {
-			router.load({ sync: true }).catch((err: unknown) => {
-				console.error(err);
-			});
-		}
-		return unsub;
+			const resolvedLocation = router.stores.resolvedLocation.get();
+			if (
+				resolvedLocation?.href === location.href &&
+				resolvedLocation.state.__TSR_key === location.state.__TSR_key
+			) {
+				// Already resolved (SSR hydration): emit `onRendered` for scroll
+				// restoration and devtools. The match tree has already committed (see
+				// below), so emit directly rather than through the acknowledgement/settle
+				// path: hydration acknowledges the matches already on screen, which —
+				// unlike a navigation that commits the *next* matches — triggers no
+				// re-render for `MatchesInner`'s settle effect to run on.
+				router.emit({
+					type: 'onRendered',
+					...getLocationChangeInfo(resolvedLocation, resolvedLocation),
+				});
+			} else if (!router._tx) {
+				router.load({ sync: true }).catch((err: unknown) => {
+					console.error(err);
+				});
+			}
+		};
+		// A resolved location's match tree normally commits before this effect, as
+		// child effects fire first. Hydration leaves the server-rendered Suspense
+		// boundary around it for a later task, as React's does, so wait for its
+		// first commit (MatchesInner): navigating now would hydrate it from matches
+		// the server never rendered. An unresolved location starts its load now.
+		if (router._matchesCommitted || router.stores.resolvedLocation.get() === undefined) mount();
+		else router._mountAfterMatches = mount;
+		return () => {
+			unsub();
+			if (router._mountAfterMatches === mount) router._mountAfterMatches = undefined;
+		};
 	}, [router, router.history]);
 }

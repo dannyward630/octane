@@ -57,6 +57,14 @@ function MatchesInner() @{
 	useLayoutEffect(() => {
 		if (acknowledgement[0] === matches) settleOwner(acknowledgement, true);
 	}, [acknowledgement, matches]);
+	// The router's mount work waits for this first commit (useTransitioner).
+	useLayoutEffect(() => {
+		const routerState = router as any;
+		routerState._matchesCommitted = true;
+		const mount = routerState._mountAfterMatches;
+		routerState._mountAfterMatches = undefined;
+		mount?.();
+	}, [router]);
 
 	<MatchContext value={routeId}>
 		<CatchWrap getResetKey={() => rootMatch} errorComponent={ErrorComponent}>

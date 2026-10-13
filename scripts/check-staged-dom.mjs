@@ -104,6 +104,12 @@ const NATIVE_OPERATIONS = new Map(
 		registerDelegatedCapture: ['call:addEventListener'],
 		registerDelegationTarget: ['read:onclick', 'write:onclick', 'call:addEventListener'],
 		unregisterDelegationTarget: ['call:removeEventListener'],
+		// A deferred Suspense arm is committed server DOM. Its queue listens on that
+		// DOM's root node from the deferring pass's commit, and an event is located
+		// against the arm's committed markers, never against projected DOM.
+		queueDeferredArm: ['call:getRootNode'],
+		listenForArmInput: ['call:addEventListener', 'call:removeEventListener'],
+		rangeContains: ['call:compareDocumentPosition'],
 		publishRegisteredManualFormPending: ['read:method'],
 		resetFormNow: ['call:reset'],
 		handleFormSubmit: ['call:reset'],
