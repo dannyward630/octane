@@ -256,18 +256,21 @@ describe('native reads in use() creations', () => {
 				const aborted: string[] = [];
 				let root: ReturnType<typeof hydrateRoot> | undefined;
 				try {
-					root = hydrateRoot(
-						container,
-						View,
-						{
-							load: (key: string, context: { signal: AbortSignal }) => {
-								started.push(key);
-								context.signal.addEventListener('abort', () => aborted.push(key));
-								return key === 'first' ? first.promise : second.promise;
+					// The Suspense arm whose loads start hydrates after the shell.
+					await act(() => {
+						root = hydrateRoot(
+							container,
+							View,
+							{
+								load: (key: string, context: { signal: AbortSignal }) => {
+									started.push(key);
+									context.signal.addEventListener('abort', () => aborted.push(key));
+									return key === 'first' ? first.promise : second.promise;
+								},
 							},
-						},
-						{ signalOwner: clientOwner },
-					);
+							{ signalOwner: clientOwner },
+						);
+					});
 					expect(started).toEqual(['first', 'second']);
 					expect(container.querySelector('.parallel-values')).toBe(before);
 					if (cancel) {

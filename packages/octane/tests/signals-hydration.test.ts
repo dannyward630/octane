@@ -271,7 +271,8 @@ describe('native signal server output and adoption', () => {
 		const output = container.querySelector('.resource');
 		model.scope.set(model.value$, 'b');
 		const observations: string[] = [];
-		flushSync(() => {
+		// The streamed boundary hydrates after the shell, inside act().
+		await act(() => {
 			root = hydrateRoot(container, client.NativeBoundaryHydration, {
 				...props,
 				resourceLog: (value: string) => observations.push(value),
@@ -361,7 +362,7 @@ describe('native signal server output and adoption', () => {
 			const output = container.querySelector('output')!;
 			const renders: string[] = [];
 			const render = (name: string) => renders.push(name);
-			flushSync(() => {
+			await act(() => {
 				root = hydrateRoot(container, client.AdoptedResource, {
 					resource$: model.resource$,
 					render,
@@ -391,7 +392,7 @@ describe('native signal server output and adoption', () => {
 			await act(() => model.scope.batch(() => model.resource$.retry()));
 			expect(model.scope.get(model.resource$)).toBe('ready-a#2');
 			const renders: string[] = [];
-			flushSync(() => {
+			await act(() => {
 				root = hydrateRoot(container, client.AdoptedResource, {
 					resource$: model.resource$,
 					render: (name: string) => renders.push(name),
@@ -415,7 +416,7 @@ describe('native signal server output and adoption', () => {
 			}).html;
 			await act(() => model.scope.batch(() => model.resource$.retry({ pending: true })));
 			const renders: string[] = [];
-			flushSync(() => {
+			await act(() => {
 				root = hydrateRoot(container, client.AdoptedResource, {
 					resource$: model.resource$,
 					render: (name: string) => renders.push(name),
