@@ -211,8 +211,13 @@ async function prepare(session, scenario) {
 async function hydrateOnce(session, scenario, browser) {
 	await prepare(session, scenario);
 	await session.page.evaluate(() => globalThis.gc?.());
-	if (browser !== undefined)
+	if (browser !== undefined) {
 		await browser.startTracing(session.page, { categories: TRACE_CATEGORIES });
+		// Let tracing reach the renderer before the measured task starts.
+		await session.page.evaluate(
+			() => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve))),
+		);
+	}
 	const durationMs = await session.page.evaluate(() =>
 		window.AppFrameHydration.hydrateFrameSettled(),
 	);
@@ -227,7 +232,10 @@ const TRACE_CATEGORIES = ['toplevel', 'devtools.timeline', 'blink.user_timing'];
 
 /**
  * The main-thread tasks between the hydrate-start and hydrate-settled marks:
- * the longest one and their total, each top-level task counted once.
+ * the longest one and their total. A task is an outermost complete event on
+ * the marks' thread, usually RunTask; a task that tracing joined after it was
+ * dispatched has no RunTask event, only its inner one. The microtask
+ * checkpoint after a task is recorded beside it and counts as part of it.
  */
 function tasksFromTrace(buffer) {
 	const parsed = JSON.parse(buffer.toString('utf8'));
@@ -241,21 +249,24 @@ function tasksFromTrace(buffer) {
 	const tasks = events
 		.filter(
 			(event) =>
-				(event.name === 'RunTask' || event.name === 'ThreadControllerImpl::RunTask') &&
 				event.ph === 'X' &&
 				event.pid === start.pid &&
 				event.tid === start.tid &&
 				event.ts + event.dur > start.ts &&
 				event.ts < end.ts,
 		)
-		.sort((a, b) => a.ts - b.ts);
+		.sort((a, b) => a.ts - b.ts || b.dur - a.dur);
 	const durations = [];
 	let outerEnd = -Infinity;
 	for (const task of tasks) {
 		if (task.ts + task.dur <= outerEnd) continue;
 		outerEnd = task.ts + task.dur;
-		durations.push(task.dur / 1000);
+		if (task.name === 'BlinkScheduler_PerformMicrotaskCheckpoint' && durations.length !== 0)
+			durations[durations.length - 1] += task.dur / 1000;
+		else durations.push(task.dur / 1000);
 	}
+	if (durations.length === 0)
+		throw new Error('The trace has no main-thread task between the hydration marks.');
 	return {
 		tasks: durations.length,
 		longestTaskMs: Math.max(...durations),
@@ -290,13 +301,20 @@ async function resetFrame(session) {
 
 /** One cold hydration: a fresh browser context, so no JIT state or feedback survives. */
 async function coldSample(browser, origin, candidate, scenario) {
-	const session = await openPage(browser, `${origin}/${candidate.name}/${scenario}`);
-	try {
-		await session.cdp.send('Emulation.setCPUThrottlingRate', { rate: throttle });
-		await loadPage(session);
-		return await hydrateOnce(session, scenario, browser);
-	} finally {
-		await session.context.close();
+	// Chromium occasionally drops a long task from the trace. That trace's
+	// longest task is shorter than the hydrateRoot call alone, and it reruns.
+	for (let attempt = 1; ; attempt++) {
+		const session = await openPage(browser, `${origin}/${candidate.name}/${scenario}`);
+		let sample;
+		try {
+			await session.cdp.send('Emulation.setCPUThrottlingRate', { rate: throttle });
+			await loadPage(session);
+			sample = await hydrateOnce(session, scenario, browser);
+		} finally {
+			await session.context.close();
+		}
+		if (sample.longestTaskMs >= sample.durationMs) return sample;
+		if (attempt === 3) throw new Error(`${session.url}: the trace missed the hydrateRoot task`);
 	}
 }
 
