@@ -28512,7 +28512,7 @@ export function setClassName(el: Element, value: unknown, foreign?: boolean): vo
 
 // Attribute-based class setter: SVG/MathML compiled TEMPLATE bindings (where
 // `className` is a read-only SVGAnimatedString so the fast `setClassName` can't be
-// used), setDeoptClass's SVG arm, and setSpread's class arm all route here.
+// used), and every runtime host's class (spreads, descriptors) route here.
 // clsx-composes the value; a nullish/false value REMOVES the attribute (parity with
 // the generic setAttribute this binding routed through before clsx composition
 // existed).
@@ -28523,19 +28523,6 @@ export function setClassAttr(el: Element, value: unknown): void {
 	if (TRANSITION_JOURNAL !== null) journalAttr(el, 'class');
 	if (cls === null) (STAGED_DOM ? STAGED_DOM.view(el) : el).removeAttribute('class');
 	else (STAGED_DOM ? STAGED_DOM.view(el) : el).setAttribute('class', cls);
-}
-
-// SVG-safe class setter for the de-opt / hostComponent paths, which (unlike the
-// compiled template) can hit an SVGElement whose `className` is a read-only
-// SVGAnimatedString. Routes SVG through the attribute-based `setClassAttr` and keeps
-// HTML on the fast `setClassName`; both clsx-compose the value and share the same
-// hydration suppress/warn semantics.
-function setDeoptClass(el: Element, value: unknown): void {
-	if (el.namespaceURI === SVG_NS) {
-		setClassAttr(el, value);
-	} else {
-		setClassName(el, value, true);
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -28807,9 +28794,9 @@ function eventSlot(name: string, el?: Element): ParsedEventSlot | null {
 }
 
 // Remove ONE host prop that was present last render and is gone this render. This is
-// the single shared removal path for all three prop-diff loops — setSpread's prev-loop,
-// patchDeoptProps' prev-loop (the de-opt reconcile path) and applyHostProps' prev-loop —
-// so removal stays symmetric with the corresponding SET path:
+// the single shared removal path for both prop-diff loops — setHostProps' (spreads and
+// descriptor hosts) and applyHostProps' (persistent runtime hosts) — so removal stays
+// symmetric with the corresponding SET path:
 //   - `class`/`className`      → removeAttribute('class') (React parity; never `class=""`).
 //   - `style`                  → setStyle(el, null, prevValue), diff-clearing an object prev.
 //   - `dangerouslySetInnerHTML`→ clear innerHTML (the raw HTML owned the content).
@@ -28821,10 +28808,9 @@ function eventSlot(name: string, el?: Element): ParsedEventSlot | null {
 //     htmlFor→for alias, aria-* semantics, and attribute-namespace routing the SET path
 //     used — a raw removeAttribute(name) here would e.g. remove the nonexistent
 //     `htmlFor` attribute and leak the real `for`.
-// `ref` is intentionally NOT handled here: each caller owns its ref lifecycle (setSpread
-// and applyHostProps detach inline with the element as the cleanup target, and
-// applyHostProps also clears `state.ref`; patchDeoptProps detaches once up front as the
-// reconcile path's sole detach point) — see the call sites.
+// `ref` is intentionally NOT handled here: each caller owns its ref lifecycle (both
+// detach inline with the element as the cleanup target, and applyHostProps also clears
+// `state.ref`) — see the call sites.
 function removeHostProp(el: Element, name: string, prevValue?: unknown): void {
 	if (name === 'class' || name === 'className') {
 		if (TRANSITION_JOURNAL !== null) journalAttr(el, 'class');
@@ -29628,6 +29614,73 @@ export function setSpread(
 	skipDangerouslySetInnerHTML = false,
 	skipFormControls = false,
 ): void {
+	// Spread-only capabilities stay out of descriptor-only bundles: a function
+	// form action (descriptor factories install it themselves, see
+	// DESCRIPTOR_FORM_ACTION) and the keys the host's own bindings write.
+	DESCRIPTOR_FORM_ACTION = setFormAction;
+	SKIP_SPREAD_KEY = skipSpreadKey;
+	if (!skipDangerouslySetInnerHTML) {
+		if (value != null && Object.prototype.propertyIsEnumerable.call(Object(value), 'children')) {
+			(STAGED_DOM ? STAGED_DOM.view(el as any) : (el as any))[DANGER_HTML_SPREAD_CHILD] =
+				value.children;
+			if (
+				value.children != null &&
+				(STAGED_DOM ? STAGED_DOM.view(el as any) : (el as any))[DANGER_HTML_ACTIVE] === true
+			) {
+				throw dangerHtmlChildrenError();
+			}
+		} else if (
+			prev != null &&
+			Object.prototype.propertyIsEnumerable.call(Object(prev), 'children')
+		) {
+			(STAGED_DOM ? STAGED_DOM.view(el as any) : (el as any))[DANGER_HTML_SPREAD_CHILD] = undefined;
+		}
+	}
+	setHostProps(
+		el,
+		value,
+		prev,
+		mountScope,
+		(skipDangerouslySetInnerHTML ? SKIP_RAW_HTML : 0) | (skipFormControls ? SKIP_FORM_CONTROLS : 0),
+	);
+}
+
+// A spread copies own enumerable keys. Descriptor props are plain own objects.
+function isOwnEnumerable(object: unknown, key: string): boolean {
+	return Object.prototype.propertyIsEnumerable.call(object, key);
+}
+
+// setHostProps flags. A compiled spread skips the keys its host's own bindings
+// write (raw HTML, aggregated form controls) through SKIP_SPREAD_KEY, which only
+// setSpread installs. DESCRIPTOR_HOST marks an element descriptor's host.
+const SKIP_RAW_HTML = 1;
+const SKIP_FORM_CONTROLS = 2;
+const SKIP_SPREAD_KEYS = SKIP_RAW_HTML | SKIP_FORM_CONTROLS;
+const DESCRIPTOR_HOST = 4;
+let SKIP_SPREAD_KEY: typeof skipSpreadKey | null = null;
+function skipSpreadKey(el: Element, k: string, flags: number): boolean {
+	return (
+		((flags & SKIP_RAW_HTML) !== 0 && k === 'dangerouslySetInnerHTML') ||
+		((flags & SKIP_FORM_CONTROLS) !== 0 && isAggregatedFormControlProp(el, k))
+	);
+}
+
+// The one generic host-prop writer, for spreads and element descriptors: it
+// diffs `prev` → `value` (`prev` is undefined on mount) by identity, removing a
+// vanished prop through the removal that mirrors its setter. Bindings whose
+// names the compiler knows call the specialized setters instead. A descriptor
+// host's scope is its owner Block: its children reconcile separately (and may be
+// a scoped accessor that must not be read here), a stamped ref marks the owner
+// for teardown, and a mounted input initializes its checkedness as React does.
+function setHostProps(
+	el: Element,
+	value: any,
+	prev: any,
+	mountScope: Scope | undefined,
+	flags: number,
+): void {
+	const descriptor = (flags & DESCRIPTOR_HOST) !== 0;
+	let needsCheckedInitialization = descriptor && prev === undefined && el.localName === 'input';
 	if (process.env.NODE_ENV !== 'production' && value != null) {
 		devValidateAriaProps(el, Object(value) as Record<string, unknown>);
 		devValidateHostProps(el, Object(value) as Record<string, unknown>);
@@ -29664,31 +29717,13 @@ export function setSpread(
 	) {
 		setNativeChangeDiagnosticMetadata(el, value.__octaneNativeChangeDiagnostic);
 	}
-	if (!skipDangerouslySetInnerHTML) {
-		if (value != null && Object.prototype.propertyIsEnumerable.call(Object(value), 'children')) {
-			(STAGED_DOM ? STAGED_DOM.view(el as any) : (el as any))[DANGER_HTML_SPREAD_CHILD] =
-				value.children;
-			if (
-				value.children != null &&
-				(STAGED_DOM ? STAGED_DOM.view(el as any) : (el as any))[DANGER_HTML_ACTIVE] === true
-			) {
-				throw dangerHtmlChildrenError();
-			}
-		} else if (
-			prev != null &&
-			Object.prototype.propertyIsEnumerable.call(Object(prev), 'children')
-		) {
-			(STAGED_DOM ? STAGED_DOM.view(el as any) : (el as any))[DANGER_HTML_SPREAD_CHILD] = undefined;
-		}
-	}
 	// Remove keys present in prev but absent in value (removeHostProp routes each to
 	// the removal that mirrors its SET path — class, style, innerHTML, suppress flag,
 	// event slot, aliased/namespaced attribute).
 	if (prev) {
-		for (const k of Object.keys(Object(prev))) {
-			if (k === 'key' || k === 'children') continue;
-			if (skipDangerouslySetInnerHTML && k === 'dangerouslySetInnerHTML') continue;
-			if (skipFormControls && isAggregatedFormControlProp(el, k)) continue;
+		for (const k in prev) {
+			if (k === 'key' || k === 'children' || (!descriptor && !isOwnEnumerable(prev, k))) continue;
+			if ((flags & SKIP_SPREAD_KEYS) !== 0 && SKIP_SPREAD_KEY!(el, k, flags)) continue;
 			if (k === 'ref') {
 				// Detach the prior ref when it's removed from the spread or its
 				// identity changed (the value loop re-attaches a changed ref).
@@ -29703,25 +29738,31 @@ export function setSpread(
 				if (prev.ref != null && prev.ref !== nextRef) queueRefDetach(prev.ref, el);
 				continue;
 			}
-			if (value != null && Object.prototype.propertyIsEnumerable.call(Object(value), k)) continue;
+			if (value != null && (descriptor ? k in value : isOwnEnumerable(value, k))) continue;
 			removeHostProp(el, k, prev[k]);
 		}
 	}
 	if (value == null) {
+		if (needsCheckedInitialization) markInputCheckedness(el as HTMLInputElement);
 		if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, mountScope);
 		return;
 	}
 	// A fresh props cache is not a snapshot of attributes already present in SSR.
 	const hydration = prev === undefined && hydrating ? activeHydration() : null;
 	const initialHydration = hydration !== null && !hydration.isFresh(el);
-	for (const k of Object.keys(Object(value))) {
-		if (k === 'key' || k === 'children') continue;
-		if (skipDangerouslySetInnerHTML && k === 'dangerouslySetInnerHTML') continue;
-		if (skipFormControls && isAggregatedFormControlProp(el, k)) continue;
+	for (const k in value) {
+		if (k === 'key' || k === 'children' || (!descriptor && !isOwnEnumerable(value, k))) continue;
+		if ((flags & SKIP_SPREAD_KEYS) !== 0 && SKIP_SPREAD_KEY!(el, k, flags)) continue;
 		const v = value[k];
 		const pv = prev ? prev[k] : undefined;
+		if (needsCheckedInitialization && (k === 'defaultChecked' || (k === 'checked' && v != null)))
+			needsCheckedInitialization = false;
 		if (k === 'ref') {
 			if (v === pv) continue;
+			if (descriptor) {
+				if (v == null) continue;
+				noteDeoptRef(mountScope as Block);
+			}
 			// Route through attachRef for full parity: callback cleanup-return,
 			// object `.current`, and array refs. The prior ref (if any) was queued
 			// for detach in the removal loop above; queued detaches drain before
@@ -29752,20 +29793,16 @@ export function setSpread(
 		}
 		// Presence matters for raw HTML: an own key whose value is undefined
 		// explicitly disables an earlier JSX writer. It must not be identity-skipped
-		// against the absent previous value on mount.
+		// against the absent previous value on mount. A descriptor's raw HTML is the
+		// element's whole content and, as in React, an unchanged object keeps it.
 		if (k === 'dangerouslySetInnerHTML') {
-			setDangerouslySetInnerHTML(el, v);
+			if (!descriptor || v !== pv) setDangerouslySetInnerHTML(el, v);
 			continue;
 		}
 		const actionName = formActionAttributeName(el, k);
 		if (actionName !== null) {
 			if (v === pv && !initialHydration) continue;
-			setFormAction(
-				el as HTMLFormElement | HTMLButtonElement | HTMLInputElement,
-				actionName,
-				v,
-				pv,
-			);
+			DESCRIPTOR_FORM_ACTION(el, actionName, v, pv);
 			continue;
 		}
 		// Styles/raw HTML above still need their setters for stable object values.
@@ -29797,6 +29834,7 @@ export function setSpread(
 		if (prev !== undefined && k === 'autoFocus' && !isHtmlCustomElement(el)) continue;
 		setAttribute(el, k, v);
 	}
+	if (needsCheckedInitialization) markInputCheckedness(el as HTMLInputElement);
 	if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, mountScope);
 }
 
@@ -31875,12 +31913,12 @@ function setFormActionAttribute(el: Element, name: string, value: unknown, _prev
 	setAttribute(el, name, value);
 }
 
-// Descriptor hosts (the de-opt renderer) receive a FUNCTION form action only
-// from an element factory that could carry one: public createElement,
-// createElementAt, or cloneElement, or compiled JSX whose props name
-// `action`/`formAction` or spread. Those install setFormAction here, so a bundle
-// whose descriptors cannot carry a function action does not retain the submit
-// driver and, through it, the transition engine.
+// setHostProps receives a FUNCTION form action only from a spread or an element
+// factory that could carry one: setSpread, public createElement, createElementAt,
+// or cloneElement, or compiled JSX whose props name `action`/`formAction` or
+// spread. Those install setFormAction here, so a bundle whose descriptors cannot
+// carry a function action does not retain the submit driver and, through it, the
+// transition engine.
 let DESCRIPTOR_FORM_ACTION: (el: any, name: string, value: unknown, prev: unknown) => void =
 	setFormActionAttribute;
 
@@ -33467,7 +33505,7 @@ function restoreControlledStates(): void {
 
 /**
  * True when `name` is a controlled prop (`value`/`checked`) on a form tag —
- * the prop-diff loops (setSpread / patchDeoptProps) use this to BYPASS their
+ * the prop-diff loops (setHostProps / applyHostProps) use this to BYPASS their
  * identity skip: controlled props must reassert on every commit even when the
  * rendered value is unchanged (the DOM may have drifted). The helpers diff
  * against the DOM, so the unconditional call stays cheap. The default* props
@@ -36609,45 +36647,9 @@ function noteDeoptRef(block: Block): void {
 	}
 }
 
-// Apply ONE host prop, reusing the same helpers the compiler emits (className/style/
-// setAttribute + `$o<type>` delegated-event slots + deferred ref attach).
-function applyDeoptProp(el: Element, name: string, v: any, ownerBlock: Block): void {
-	const actionName = formActionAttributeName(el, name);
-	if (actionName !== null) {
-		DESCRIPTOR_FORM_ACTION(el, actionName, v, undefined);
-		return;
-	}
-	if (name === 'ref') {
-		if (v != null) {
-			noteDeoptRef(ownerBlock);
-			queueRefAttach(ownerBlock, v, el);
-		}
-	} else if (name === 'className' || name === 'class') {
-		setDeoptClass(el, v);
-	} else if (name === 'style') {
-		setStyle(el as HTMLElement, v, undefined);
-	} else {
-		// eventSlot returns non-null exactly for `on<Upper>` delegated-handler names
-		// (the same classification setSpread/applyHostProps use).
-		const ev = eventSlot(name, el);
-		if (ev !== null) {
-			setEventHandler(
-				el,
-				ev.key,
-				process.env.NODE_ENV !== 'production' ? devEventListener(name, v) : v,
-			);
-			if (ev.capture) {
-				if (!_delegatedCapture.has(ev.type)) delegateCaptureEvents([ev.type]);
-			} else if (!_delegated.has(ev.type)) delegateEvents([ev.type]);
-		} else {
-			setAttribute(el, name, v);
-		}
-	}
-}
-
 // React contract: `dangerouslySetInnerHTML` and `children` are mutually exclusive —
 // the raw HTML owns the element's content. When present, the de-opt paths must SKIP
-// child reconciliation entirely: applyDeoptProps/patchDeoptProps already wrote
+// child reconciliation entirely: setHostProps already wrote
 // `el.innerHTML`, and running childSlot/reconcileDeoptChildren with (empty) children
 // would wipe it. (SSR already implements raw-HTML-wins; see runtime.server.ts.)
 // Supplying BOTH is a programming error — throw like React (silently letting the
@@ -36671,7 +36673,6 @@ function hasHostPropContent(descriptor: ElementDescriptor): boolean {
 	);
 }
 
-// Route a host descriptor's props onto a FRESH element (first build).
 function markInputCheckedness(input: HTMLInputElement): void {
 	// React initializes even an input with no checked/defaultChecked prop. Mark
 	// its live property dirty so a baseline added on a reused host stays a reset
@@ -36680,84 +36681,6 @@ function markInputCheckedness(input: HTMLInputElement): void {
 		STAGED_DOM ? STAGED_DOM.view(input) : input
 	).checked;
 	(STAGED_DOM ? STAGED_DOM.view(input as any) : (input as any))[DEFAULT_CHECKED_INITIALIZED] = true;
-}
-
-function applyDeoptProps(el: Element, props: any, ownerBlock: Block): void {
-	if (props == null) {
-		if (el.localName === 'input') markInputCheckedness(el as HTMLInputElement);
-		if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, ownerBlock);
-		return;
-	}
-	let needsCheckedInitialization = el.localName === 'input';
-	for (const name in props) {
-		if (name === 'key' || name === 'children') continue;
-		// `suppressHydrationWarning`: a JS flag (read by the hydration-mismatch paths), never
-		// a DOM attribute.
-		if (name === 'suppressHydrationWarning') {
-			(el as any).__oct_suppress = props[name] === true;
-			continue;
-		}
-		const value = props[name];
-		if (
-			needsCheckedInitialization &&
-			(name === 'defaultChecked' || (name === 'checked' && value != null))
-		)
-			needsCheckedInitialization = false;
-		applyDeoptProp(el, name, value, ownerBlock);
-	}
-	if (needsCheckedInitialization) markInputCheckedness(el as HTMLInputElement);
-	if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, ownerBlock);
-}
-
-// Diff prev → next props on a REUSED element (the reconcile path): remove props that
-// disappeared, set new/changed ones. Unchanged props are skipped, so an unchanged
-// `ref` is not re-attached and an unchanged handler is not re-bound.
-function patchDeoptProps(el: Element, prevProps: any, nextProps: any, ownerBlock: Block): void {
-	// ref lifecycle on a REUSED node: detach the previous ref if it was removed or its identity
-	// changed (the apply loop below re-attaches a changed one via applyDeoptProp). Without this a
-	// removed/swapped `ref={obj}` keeps pointing at this element. The prev-loop below skips
-	// `ref`, so this is the sole detach point for the reconcile path (the detach passes the
-	// element so a callback ref shared across elements releases its per-element cleanup).
-	// Queued for commit — the re-attach is queued too (applyDeoptProp), and detaches drain
-	// first, so a ref hopping between elements never ends null (React mutation→layout order).
-	const prevRef = prevProps != null ? prevProps.ref : undefined;
-	const nextRef = nextProps != null ? nextProps.ref : undefined;
-	if (prevRef != null && prevRef !== nextRef) queueRefDetach(prevRef, el);
-	if (prevProps != null) {
-		for (const name in prevProps) {
-			// `ref` was handled above; everything else routes through the shared removal
-			// path — including `suppressHydrationWarning`, whose disappearance must reset
-			// the element's `__oct_suppress` flag (parity with applyHostProps' prev-loop).
-			if (name === 'key' || name === 'children' || name === 'ref') continue;
-			if (nextProps == null || !(name in nextProps)) removeHostProp(el, name, prevProps[name]);
-		}
-	}
-	if (nextProps != null) {
-		for (const name in nextProps) {
-			if (name === 'key' || name === 'children') continue;
-			if (name === 'suppressHydrationWarning') {
-				(el as any).__oct_suppress = nextProps[name] === true;
-				continue;
-			}
-			const nv = nextProps[name];
-			// Controlled `value`/`checked` bypass the prev-diff skip (reassert
-			// on every commit; the helper's DOM-diff keeps the call cheap).
-			if (prevProps == null || prevProps[name] !== nv || isControlledHostProp(el, name)) {
-				// This path always reuses an existing host; autoFocus is mount-only.
-				if (name === 'autoFocus' && !isHtmlCustomElement(el)) continue;
-				// `applyDeoptProp` is the FRESH-element helper — its style arm passes
-				// prev=undefined, which on a REUSED element leaves declarations dropped
-				// from the style object stale (applyStyleValue can only remove keys it
-				// can diff against). Thread the real previous style here.
-				if (name === 'style') {
-					setStyle(el as HTMLElement, nv, prevProps != null ? prevProps.style : undefined);
-				} else {
-					applyDeoptProp(el, name, nv, ownerBlock);
-				}
-			}
-		}
-	}
-	if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, ownerBlock);
 }
 
 interface HostComponentSlot {
@@ -36861,9 +36784,10 @@ export function hostComponent(
 	return el;
 }
 
-// Like applyDeoptProps but for a PERSISTENT element (re-applied each render): the
-// ref is attached once and only re-attached when it changes (not every render),
-// while className/style/events/attributes are idempotently re-set.
+// Props for a PERSISTENT runtime host (hostComponent), re-applied each render. Unlike
+// setHostProps' identity diff, an unchanged prop is re-asserted against the live
+// target (foreign edits and mutable values included), while the ref is attached once
+// and only re-attached when it changes.
 function applyHostProps(el: Element, props: any, scope: Scope, state: HostComponentSlot): void {
 	const prev = state.props;
 	const compareLive =
@@ -36871,7 +36795,7 @@ function applyHostProps(el: Element, props: any, scope: Scope, state: HostCompon
 	let needsCheckedInitialization = prev === undefined && el.localName === 'input';
 	if (ROOT_RENDER_TRANSACTION !== null && prev !== props) journalObjectOnce(state);
 	// REMOVE props/events present last render but gone now, via the shared removeHostProp
-	// (parity with setSpread / patchDeoptProps) — a reused element must not keep stale
+	// (parity with setHostProps) — a reused element must not keep stale
 	// props/listeners. `ref` stays here (not in removeHostProp) because this path also
 	// clears the persistent `state.ref` alongside the detach.
 	if (prev != null) {
@@ -36930,7 +36854,7 @@ function applyHostProps(el: Element, props: any, scope: Scope, state: HostCompon
 				typeof v !== 'string' ||
 				(STAGED_DOM ? STAGED_DOM.view(el) : el).getAttribute('class') !== v
 			) {
-				setDeoptClass(el, v);
+				setClassAttr(el, v);
 			}
 		} else if (name === 'style') {
 			setStyle(el as HTMLElement, v, prev != null ? prev.style : undefined);
@@ -36980,7 +36904,7 @@ function applyHostProps(el: Element, props: any, scope: Scope, state: HostCompon
 }
 
 // The descriptor that last produced a de-opt host element is stashed on the element
-// as a typed expando, so a re-render can diff props (patchDeoptProps) and match
+// as a typed expando, so a re-render can diff props (setHostProps) and match
 // children by key against the live DOM — WITHOUT rebuilding, which would destroy
 // DOM-resident state (input value, focus, selection, scroll, media). A direct
 // property (not a WeakMap) keeps the per-child lookup in reconcileDeoptChildren cheap;
@@ -37457,14 +37381,14 @@ function reconcileDeoptNode(
 		) {
 			// REUSE the existing element — patch props in place instead of rebuilding.
 			el = prev as Element;
-			patchDeoptProps(el, getDeoptDesc(el)?.props ?? null, value.props, ownerBlock);
+			setHostProps(el, value.props, getDeoptDesc(el)?.props ?? null, ownerBlock, DESCRIPTOR_HOST);
 		} else {
 			el =
 				elNs !== undefined
 					? (STAGED_DOM ? STAGED_DOM.view(document) : document).createElementNS(elNs, value.type)
 					: (STAGED_DOM ? STAGED_DOM.view(document) : document).createElement(value.type);
 			if (hydrating) activeHydration()?.markFresh(el);
-			applyDeoptProps(el, value.props, ownerBlock);
+			setHostProps(el, value.props, undefined, ownerBlock, DESCRIPTOR_HOST);
 		}
 		setDeoptDesc(el, value);
 		if (!hasHostPropContent(value)) {
@@ -38280,7 +38204,7 @@ function hostElementBody(d: ElementDescriptor, block: Block): void {
 	) {
 		el = hydration.node as Element;
 		block.deoptNode = el;
-		applyDeoptProps(el, d.props, block);
+		setHostProps(el, d.props, undefined, block, DESCRIPTOR_HOST);
 		setDeoptDesc(el, d);
 		const savedCursor = getNextSibling(hydration.node);
 		if (!hasHostPropContent(d)) {
@@ -38360,10 +38284,10 @@ function hostElementBody(d: ElementDescriptor, block: Block): void {
 		block.deoptNode = el;
 		const parent = block.parentNode;
 		(STAGED_DOM ? STAGED_DOM.view(parent) : parent).insertBefore(el, block.endMarker);
-		applyDeoptProps(el, d.props, block);
+		setHostProps(el, d.props, undefined, block, DESCRIPTOR_HOST);
 	} else {
 		// REUSE the existing element — diff props in place (no rebuild).
-		patchDeoptProps(el, getDeoptDesc(el)?.props ?? null, d.props, block);
+		setHostProps(el, d.props, getDeoptDesc(el)?.props ?? null, block, DESCRIPTOR_HOST);
 	}
 	setDeoptDesc(el, d);
 	// One childSlot renders all children INTO the element (append; no anchor): it
@@ -38410,7 +38334,7 @@ function hostStringTagBody(d: ElementDescriptor, block: Block): void {
 			// server emitted no inner markers).
 			el = hydration.node as Element;
 			block.deoptNode = el;
-			applyDeoptProps(el, d.props, block);
+			setHostProps(el, d.props, undefined, block, DESCRIPTOR_HOST);
 			setDeoptDesc(el, d);
 			const savedCursor = getNextSibling(hydration.node);
 			if (!hasHostPropContent(d)) {
@@ -38442,10 +38366,10 @@ function hostStringTagBody(d: ElementDescriptor, block: Block): void {
 		block.deoptNode = el;
 		const parent = block.parentNode;
 		(STAGED_DOM ? STAGED_DOM.view(parent) : parent).insertBefore(el, block.endMarker);
-		applyDeoptProps(el, d.props, block);
+		setHostProps(el, d.props, undefined, block, DESCRIPTOR_HOST);
 	} else {
 		// Re-render, same tag — diff props in place against the stamped descriptor.
-		patchDeoptProps(el, getDeoptDesc(el)?.props ?? null, d.props, block);
+		setHostProps(el, d.props, getDeoptDesc(el)?.props ?? null, block, DESCRIPTOR_HOST);
 	}
 	setDeoptDesc(el, d);
 	if (!hasHostPropContent(d)) renderHostTagChildren(d, block, el);
