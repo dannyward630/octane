@@ -24995,7 +24995,7 @@ function jsxElementToCreateElement(node, ctx, eagerRoot = false) {
 		const attrName = attr.name.name || attr.name;
 		// `key` is KEPT in props — `createElement` lifts it into `descriptor.key`,
 		// which the de-opt list path keys on. `ref` also flows through (the de-opt
-		// renderer's applyDeoptProps attaches it).
+		// renderer's setHostProps attaches it).
 		let valNode;
 		if (attr.value == null) {
 			valNode = inheritOriginLoc(b.literal(true), attr);
