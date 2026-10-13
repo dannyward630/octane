@@ -9,6 +9,7 @@ import {
 	derivedState,
 	endSignalBatch,
 	historicalBindingRead,
+	initializeValue,
 	inspectNativeNode,
 	isThenable,
 	readNode,
@@ -69,6 +70,8 @@ import type {
 	SignalTraceEvent,
 	WritableSignal,
 } from './types.js';
+
+declare const __OCTANE_PROFILE_ENABLED__: boolean;
 
 interface DecodedSeedEntry {
 	readonly entry: SignalSeedEntry;
@@ -262,10 +265,7 @@ export class ScopeImpl implements Scope, GraphOwner {
 	signal$<T>(key: string, initial: T): WritableSignal<T> {
 		const node = createScopeNode<T>(this, key, 'signal');
 		const seed = initialScopeSeed(this, key) ?? retainedScopeSeed(this, key);
-		node.state = readyState(seed ? (seed.value as T) : initial);
-		node.lastState = node.state;
-		node.last = (node.state.snapshot as { value: T }).value;
-		node.hasLast = true;
+		initializeValue(node, seed ? (seed.value as T) : initial);
 		consumeScopeSeed(this, key);
 		return node as WritableSignal<T>;
 	}
@@ -533,28 +533,32 @@ class AdoptionFrameImpl implements AdoptionFrame {
 					subscribers.add(notify);
 					return () => subscribers.delete(notify);
 				},
-				inspect: () => {
-					// Look up metadata on demand instead of capturing the seed payload
-					// in a source that a renderer may still hold after lease release.
-					const presented = this.ended
-						? undefined
-						: presentedSeed(this.data.entries, node.key, read);
-					return {
-						...inspectNativeNode(node, read),
-						status: presented
-							? presented.entry.available === false
-								? 'pending'
-								: 'ready'
-							: 'unevaluated',
-						revision: this.ended ? 1 : 0,
-						historical: true,
-						retained: !!presented && presented.entry.available !== false,
-						refreshing: presented?.entry.refreshing ?? false,
-						connection: presented?.entry.connection ?? 'none',
-						complete: presented?.entry.complete ?? false,
-						dependencies: [],
-					};
-				},
+				retired: () => node.owner.retired,
+				inspect:
+					typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__
+						? () => {
+								// Look up metadata on demand instead of capturing the seed payload
+								// in a source that a renderer may still hold after lease release.
+								const presented = this.ended
+									? undefined
+									: presentedSeed(this.data.entries, node.key, read);
+								return {
+									...inspectNativeNode(node, read),
+									status: presented
+										? presented.entry.available === false
+											? 'pending'
+											: 'ready'
+										: 'unevaluated',
+									revision: this.ended ? 1 : 0,
+									historical: true,
+									retained: !!presented && presented.entry.available !== false,
+									refreshing: presented?.entry.refreshing ?? false,
+									connection: presented?.entry.connection ?? 'none',
+									complete: presented?.entry.complete ?? false,
+									dependencies: [],
+								};
+							}
+						: undefined,
 			};
 			this.sources.set(channel, source);
 		} else if (source.node !== node) source.node = null;
@@ -894,10 +898,7 @@ export function createDeclaredSignalCell<T>(
 	const [node, created] = declaredScopeNode<T>(owner, key, 'signal');
 	if (!created) return node as WritableSignal<T>;
 	const seed = initialScopeSeed(owner, key) ?? retainedScopeSeed(owner, key);
-	node.state = readyState(seed && !preferInitial ? (seed.value as T) : initial);
-	node.lastState = node.state;
-	node.last = (node.state.snapshot as { value: T }).value;
-	node.hasLast = true;
+	initializeValue(node, seed && !preferInitial ? (seed.value as T) : initial);
 	consumeScopeSeed(owner, key);
 	return node as WritableSignal<T>;
 }

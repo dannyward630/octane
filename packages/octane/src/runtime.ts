@@ -1912,12 +1912,13 @@ function inspectNativeReadScope(
 	scope: import('./devtools-hook.js').DevtoolsScopeLike,
 ): import('./devtools-hook.js').DevtoolsNativeReadInspection | null {
 	const current = scope as Scope;
-	const inspection = NATIVE_READ_DRIVER?.inspectScope(current);
+	// Installed only in profiling builds, where the driver and retries inspect.
+	const inspection = NATIVE_READ_DRIVER?.inspectScope!(current);
 	const block = inspection?.block ?? current.block;
 	const retry =
-		NATIVE_BLOCK_RETRIES?.get(block)?.inspect() ??
+		NATIVE_BLOCK_RETRIES?.get(block)?.inspect!() ??
 		(block.idState.renderOwner?.current === block
-			? block.idState.renderOwner.nativeRetry?.inspect()
+			? block.idState.renderOwner.nativeRetry?.inspect!()
 			: undefined) ??
 		[];
 	if (inspection == null && retry.length === 0) return null;
@@ -39285,14 +39286,19 @@ export function childSlot(
 			}
 		}
 	}
-	if (IMPLICIT_SIGNAL_CHILD_DEPTH === 0) {
+	// Only a loaded signal engine (or a module compiled with signal bindings) can
+	// hand a handle to this hole. Neither flag is ever set in a signal-free app,
+	// so the bundler folds this whole branch away there.
+	if ((SIGNAL_BINDINGS_ENABLED || NATIVE_SIGNAL_HYDRATION) && IMPLICIT_SIGNAL_CHILD_DEPTH === 0) {
 		const existing = parentScope.slots[slotKey] as ChildSlot | undefined;
 		const previous = existing?.implicitSignal;
 		if (isSignalHandle(value) || previous !== undefined) {
 			// An arbitrary prop/alias is syntactically indistinguishable from another
 			// renderable child. Keep ordinary primitives untouched and activate the
 			// signal owner only after the nominal runtime capability is observed.
-			if (isSignalHandle(value)) enableSignalBindings();
+			// Enabling the document, not enableSignalBindings, keeps that flag's
+			// only writer out of every bundle that renders a child.
+			if (!signalDocumentEnabled && isSignalHandle(value)) enableSignalDocument(1);
 			IMPLICIT_SIGNAL_CHILD_DEPTH++;
 			let token: unknown;
 			try {
