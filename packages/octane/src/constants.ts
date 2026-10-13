@@ -81,9 +81,10 @@ export const UNDEFINED_SENTINEL_KEY = '__octane_new_undefined__';
 export const SUSPENSE_SEED_WIRE_PREFIX = '\0octane:ssr-seed:';
 
 /**
- * Top-level envelope key used only when a server hydration-seed stream contains
- * rejected `use(thenable)` entries. Keeping rejection metadata outside the
- * fulfilled value array prevents user data from colliding with the protocol.
+ * Top-level envelope key used only when a server hydration-seed stream records
+ * which compiler-owned request sites it seeded. Keeping that metadata outside
+ * the fulfilled value array prevents user data from colliding with the
+ * protocol. (The key's name predates the envelope's current use.)
  */
 export const REJECTION_SENTINEL_KEY = '__octane_new_rejection__';
 

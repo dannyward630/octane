@@ -43,12 +43,12 @@ import {
 	type BindingKey,
 } from './dom-binding-protocol.js';
 import {
+	CLIENT_ERROR_ARM_COMMENT,
 	CLIENT_RENDER_ARM_COMMENT,
 	formatUseId,
 	HYDRATION_FOR_EMPTY,
 	HYDRATION_FOR_ITEMS,
 	HYDRATION_START,
-	TRY_CATCH_COMMENT,
 } from './hydration-markers.js';
 import {
 	ACTIVITY_TAG,
@@ -654,7 +654,8 @@ let FALLBACK_HOIST_DEPTH = 0;
 // caches each outcome in RESOLVED (keyed by the FRAME path + compiler-injected
 // call-site key + per-frame occurrence index), then re-renders — a later pass'
 // use() finds the cached value and returns it, so the @try renders its success
-// arm (or, on rejection, routes the error to @catch). SERIAL collects the
+// arm (or, on rejection, throws to the nearest Suspense boundary, which ships
+// its fallback for a client render). SERIAL collects the
 // resolved values in render (depth-first) order so the client can seed them back
 // in the same order during hydration.
 //
@@ -701,7 +702,7 @@ interface Frame {
 	deferred: boolean;
 	// Async control-arm scope active where this component instance was entered.
 	// Discovery re-runs restore it before replaying the component so identical
-	// child positions in @try content/pending/catch arms never share cache keys.
+	// child positions in @try content/pending arms never share cache keys.
 	asyncScope: string;
 	/** Parser context supplied by, or inherited through, the component call site. */
 	namespace: 'html' | 'svg' | 'mathml' | undefined;
@@ -725,48 +726,15 @@ interface Job {
 let SUSPENDED: { promise: PromiseLike<unknown>; key: string }[] | null = null;
 let RESOLVED: ResolvedMap | null = null;
 let SERIAL: unknown[] | null = null;
-// Seed runs that boundaries moved out of SERIAL into their own sidecar or
-// stream segment, in splice order. Either one ships inside the boundary's
-// HTML, so an enclosing @try that renders its catch arm instead discards it,
-// while the client still replays that try body against positional seeds (see
-// ssrTry's catch path). Every rewind of SERIAL rewinds this list to the same
-// checkpoint.
-let SERIAL_ISOLATIONS: SerialIsolation[] | null = null;
-interface SerialIsolation {
-	at: number;
-	seeds: unknown[];
-}
 
 /** Move the seeds after a checkpoint out of SERIAL for a boundary's own payload. */
 function isolateSerial(serialStart: number): unknown[] {
-	if (SERIAL === null) return [];
-	const seeds = SERIAL.splice(serialStart);
-	if (seeds.length !== 0) (SERIAL_ISOLATIONS ??= []).push({ at: serialStart, seeds });
-	return seeds;
+	return SERIAL === null ? [] : SERIAL.splice(serialStart);
 }
 
-/** Drop the seeds, and the isolated runs, a discarded render left after a checkpoint. */
-function rewindSerial(serialStart: number, isolationStart: number): void {
+/** Drop the seeds a discarded render left after a checkpoint. */
+function rewindSerial(serialStart: number): void {
 	if (SERIAL !== null) SERIAL.length = serialStart;
-	if (SERIAL_ISOLATIONS !== null) SERIAL_ISOLATIONS.length = isolationStart;
-}
-
-/**
- * Put back, at their original positions, the runs isolated since a checkpoint.
- * Each run was spliced off the then-tail of SERIAL, so undoing the splices in
- * reverse order restores render order, including runs nested in other runs.
- */
-function restoreSerialIsolations(isolationStart: number): void {
-	const isolations = SERIAL_ISOLATIONS;
-	if (isolations === null || SERIAL === null) return;
-	for (let i = isolations.length - 1; i >= isolationStart; i--) {
-		// No spread: a large run would overflow the call's argument stack.
-		const { at, seeds } = isolations[i];
-		const tail = SERIAL.splice(at);
-		for (let j = 0; j < seeds.length; j++) SERIAL.push(seeds[j]);
-		for (let j = 0; j < tail.length; j++) SERIAL.push(tail[j]);
-	}
-	isolations.length = isolationStart;
 }
 // The active component frame (see Frame). Never null during a render pass —
 // render() installs a root frame before invoking the component.
@@ -4930,7 +4898,6 @@ function captureComponentReplayState(scope: SSRScope, frame: Frame | null) {
 		headXfer: headCollections?.preloadXfer ?? null,
 		serial,
 		serialLength: serial !== null ? serial.length : 0,
-		serialIsolations: SERIAL_ISOLATIONS?.length ?? 0,
 		susp,
 		suspLength: susp !== null ? susp.length : 0,
 		jobs,
@@ -5002,7 +4969,6 @@ function rewindComponentReplayState(
 		}
 	}
 	if (snapshot.serial !== null) snapshot.serial.length = snapshot.serialLength;
-	if (SERIAL_ISOLATIONS !== null) SERIAL_ISOLATIONS.length = snapshot.serialIsolations;
 	if (snapshot.susp !== null) snapshot.susp.length = snapshot.suspLength;
 	if (snapshot.jobs !== null) snapshot.jobs.length = snapshot.jobsLength;
 	VT_SSR_TRY_SEQ = snapshot.vtTrySeq;
@@ -5910,18 +5876,16 @@ const PermanentStaticHydrate = /* @__PURE__ */ markComponentFlags(
 				return ssrHtml(ssrChildrenHtml(props.children, scope));
 			const childIdStart = ID_COUNTER;
 			const serialStart = SERIAL?.length ?? 0;
-			const isolationStart = SERIAL_ISOLATIONS?.length ?? 0;
 			const children = ssrBlock(
 				ssrTry(
 					scope,
 					'jsx-static-hydrate',
 					(_arg, childScope) => ssrChildrenHtml(props.children, childScope),
 					null,
-					null,
 				),
 			);
 			const idCount = ID_COUNTER - childIdStart;
-			rewindSerial(serialStart, isolationStart);
+			rewindSerial(serialStart);
 			const streamToken = streamTokenForPendingHtml(children);
 			const markerToken = streamToken === null ? '' : streamToken + ':';
 			const endToken = streamToken === null ? '' : ':' + streamToken;
@@ -5977,7 +5941,6 @@ const hydrate = /* @__PURE__ */ markComponentFlags(
 										scope,
 										'jsx-hydrate',
 										(_arg, childScope) => ssrChildrenHtml(props.children, childScope),
-										null,
 										null,
 										'html',
 									),
@@ -6068,18 +6031,13 @@ export const Suspense = /* @__PURE__ */ markComponentFlags(
 	function Suspense(props: { fallback?: unknown; children?: unknown }, scope: SSRScope): string {
 		// Routed through ssrTry so a JSX `<Suspense>` in a `.ts` binding tree is a
 		// real STREAMING boundary too (registration + template sentinel), with the
-		// identical nested-block shape for buffered renders. Unlike an authored
-		// @try/@pending, JSX Suspense recovers server errors for a client retry.
+		// identical nested-block shape for buffered renders.
 		return ssrHtml(
 			ssrTry(
 				scope,
 				'jsx-suspense',
 				(_arg, s) => ssrChildrenHtml(props.children, s),
 				(_arg, s) => ssrChild(props.fallback, s),
-				null,
-				FRAME?.namespace ?? 'html',
-				false,
-				true,
 			),
 		);
 	},
@@ -6610,16 +6568,12 @@ export function addTransitionType(_type: string): void {}
 
 /**
  * `<ErrorBoundary fallback={…}>…</ErrorBoundary>` — the JSX built-in mirror of
- * `@try { … } @catch (e) { fallback }`. `fallback` is a renderable or a
- * `(error, reset) => renderable` render prop (react-error-boundary style). A real
- * error during render swaps to the fallback; a suspension rethrows so an outer
- * `<Suspense>`/`@pending` handles it (matching the client ErrorBoundary's explicit
- * suspension propagation). `reset` is a server no-op (no re-render).
- *
- * Routed through ssrTry, like the compiled catch-only boundary, so a caught arm
- * carries the same catch marker and seed counts: the client's ErrorBoundary
- * (a catch-only tryBlock) replays the body and adopts the fallback the server
- * rendered instead of mistaking it for the body's content.
+ * `@try { … } @catch (e) { fallback }`. As in React, whose server never runs an
+ * error boundary, `fallback` renders only on the client: a render error passes
+ * to the nearest `<Suspense>`/`@pending`, which ships its own fallback for a
+ * client render, and a suspension rethrows to it too (matching the client
+ * ErrorBoundary's explicit suspension propagation). Routed through ssrTry, like
+ * the compiled catch-only boundary, for the same range shape.
  */
 export const ErrorBoundary = /* @__PURE__ */ markComponentFlags(
 	function ErrorBoundary(
@@ -6632,13 +6586,6 @@ export const ErrorBoundary = /* @__PURE__ */ markComponentFlags(
 				'jsx-error-boundary',
 				(_arg, s) => ssrChildrenHtml(props.children, s),
 				null,
-				(error, s, reset) =>
-					ssrChild(
-						typeof props.fallback === 'function'
-							? (props.fallback as (err: unknown, reset: () => void) => unknown)(error, reset)
-							: props.fallback,
-						s,
-					),
 				FRAME?.namespace ?? 'html',
 				true,
 			),
@@ -6706,7 +6653,8 @@ export function useContext<T>(ctx: Context<T>): T {
 // Sentinel thrown by `use(thenable)` on the server when the value isn't resolved
 // yet. The nearest `@try` catches it and renders its `@pending` fallback (see the
 // compiler's ssrEmitTry) for this pass; render()'s loop then awaits the thenable
-// and re-renders. Distinct from real errors, which route to `@catch`.
+// and re-renders. Distinct from real errors, which a Suspense boundary reports
+// and leaves for a client render (see ssrTry).
 const SSR_SUSPENSE = Symbol('octane.ssr.suspense');
 export function ssrIsSuspense(err: unknown): boolean {
 	return err === SSR_SUSPENSE;
@@ -6718,7 +6666,7 @@ function normalizeThrownServerThenable(error: unknown): unknown {
 		if (typeof (error as PromiseLike<unknown>).then !== 'function') return error;
 	} catch {
 		// An opaque rejection reason need not permit property access. Preserve it
-		// for the application's catch arm instead of replacing it with a probe error.
+		// as the application threw it instead of replacing it with a probe error.
 		return error;
 	}
 	// Resource readers own their resolved values. Register only retry work, not
@@ -6741,193 +6689,11 @@ function normalizeThrownServerThenable(error: unknown): unknown {
 	return SSR_SUSPENSE;
 }
 
-type HydrationRejectionPayload =
-	| { kind: 'value'; value?: unknown }
-	| { kind: 'number'; value: 'NaN' | 'Infinity' | '-Infinity' | '-0' }
-	| { kind: 'bigint'; value: string }
-	| { kind: 'symbol'; value: string }
-	| { kind: 'error'; name: string; message: string; fields: Record<string, unknown> }
-	| { kind: 'fallback'; message: string };
-
-const HYDRATION_REJECTION_SEED = Symbol('octane.ssr.hydration-rejection-seed');
 const HYDRATION_SITE_EVENT = Symbol('octane.ssr.hydration-site');
-interface HydrationRejectionSeed {
-	[HYDRATION_REJECTION_SEED]: HydrationRejectionPayload;
-}
 
 interface HydrationSiteEvent {
 	[HYDRATION_SITE_EVENT]: string;
 	value: unknown;
-}
-
-interface ReasonSnapshotState {
-	active: WeakSet<object>;
-	nodes: number;
-}
-
-// Build a bounded, detached JSON-safe snapshot without invoking toJSON. Plain
-// object/array fields survive, cycles become an explicit marker, and hostile
-// accessors/proxies or unsupported nested values degrade locally rather than
-// making the entire SSR response fail during the final JSON.stringify.
-function reasonSnapshot(
-	value: unknown,
-	state: ReasonSnapshotState = { active: new WeakSet(), nodes: 0 },
-	depth: number = 0,
-): unknown {
-	if (
-		value === null ||
-		typeof value === 'string' ||
-		typeof value === 'boolean' ||
-		typeof value === 'undefined'
-	)
-		return value;
-	if (typeof value === 'number') {
-		return Number.isFinite(value) && !Object.is(value, -0) ? value : String(value);
-	}
-	if (typeof value === 'bigint') return String(value);
-	if (typeof value === 'symbol') return '[symbol]';
-	if (typeof value === 'function') return '[function]';
-	if (depth >= 20 || state.nodes++ >= 512) return '[truncated]';
-	if (state.active.has(value)) return '[Circular]';
-	state.active.add(value);
-	try {
-		let isArray: boolean;
-		try {
-			isArray = Array.isArray(value);
-		} catch {
-			return '[unavailable]';
-		}
-		if (isArray) {
-			const arrayValue = value as unknown[];
-			let length = 0;
-			try {
-				length = Math.min(arrayValue.length, 512);
-			} catch {
-				return '[unavailable]';
-			}
-			const out = new Array(length);
-			for (let i = 0; i < length; i++) {
-				try {
-					if (hasOwnProp.call(arrayValue, i)) {
-						out[i] = reasonSnapshot(arrayValue[i], state, depth + 1);
-					}
-				} catch {
-					out[i] = '[unavailable]';
-				}
-			}
-			return out;
-		}
-		const out: Record<string, unknown> = Object.create(null);
-		let keys: string[];
-		try {
-			keys = Object.keys(value);
-		} catch {
-			return '[unavailable]';
-		}
-		const length = Math.min(keys.length, 512);
-		for (let i = 0; i < length; i++) {
-			const key = keys[i];
-			try {
-				out[key] = reasonSnapshot((value as any)[key], state, depth + 1);
-			} catch {
-				out[key] = '[unavailable]';
-			}
-		}
-		if (keys.length > length) out.__octane_truncated__ = true;
-		return out;
-	} finally {
-		state.active.delete(value);
-	}
-}
-
-function isErrorReason(reason: unknown): boolean {
-	try {
-		if (reason instanceof Error) return true;
-		if (reason === null || typeof reason !== 'object') return false;
-		const tag = Object.prototype.toString.call(reason);
-		return tag === '[object Error]' || tag === '[object DOMException]';
-	} catch {
-		return false;
-	}
-}
-
-function hydrationRejectionPayload(reason: unknown): HydrationRejectionPayload {
-	try {
-		return hydrationRejectionPayloadUnsafe(reason);
-	} catch {
-		// Rejection transport must never replace the application's original reason
-		// with an encoder failure. Opaque proxies and exotic host objects degrade
-		// to a fixed message while still seeding the client's catch arm.
-		return { kind: 'fallback', message: formatServerError(23) };
-	}
-}
-
-function hydrationRejectionPayloadUnsafe(reason: unknown): HydrationRejectionPayload {
-	if (typeof reason === 'number' && (!Number.isFinite(reason) || Object.is(reason, -0))) {
-		return {
-			kind: 'number',
-			value: Number.isNaN(reason)
-				? 'NaN'
-				: Object.is(reason, -0)
-					? '-0'
-					: reason === Infinity
-						? 'Infinity'
-						: '-Infinity',
-		};
-	}
-	if (typeof reason === 'bigint') return { kind: 'bigint', value: String(reason) };
-	if (typeof reason === 'symbol') return { kind: 'symbol', value: reason.description ?? '' };
-	if (isErrorReason(reason)) {
-		let name = 'Error';
-		let message = formatServerError(23);
-		try {
-			const candidate = (reason as any).name;
-			if (typeof candidate === 'string') name = candidate;
-		} catch {
-			/* hostile getter — retain the safe fallback */
-		}
-		try {
-			const candidate = (reason as any).message;
-			if (typeof candidate === 'string') message = candidate;
-		} catch {
-			/* hostile getter — retain the safe fallback */
-		}
-		const fields: Record<string, unknown> = Object.create(null);
-		let keys: string[] = [];
-		try {
-			keys = Object.keys(reason as object);
-		} catch {
-			/* hostile proxy — emit the core Error fields only */
-		}
-		const length = Math.min(keys.length, 512);
-		const snapshotState: ReasonSnapshotState = { active: new WeakSet(), nodes: 0 };
-		snapshotState.active.add(reason as object);
-		for (let i = 0; i < length; i++) {
-			const key = keys[i];
-			if (key === 'name' || key === 'message' || key === 'stack') continue;
-			try {
-				fields[key] = reasonSnapshot((reason as any)[key], snapshotState);
-			} catch {
-				fields[key] = '[unavailable]';
-			}
-		}
-		if (keys.length > length) fields.__octane_truncated__ = true;
-		return { kind: 'error', name, message, fields };
-	}
-	if (typeof reason === 'function') {
-		return { kind: 'fallback', message: formatServerError(45) };
-	}
-	return { kind: 'value', value: reasonSnapshot(reason) };
-}
-
-function hydrationRejectionSeed(reason: unknown): HydrationRejectionSeed {
-	return { [HYDRATION_REJECTION_SEED]: hydrationRejectionPayload(reason) };
-}
-
-function isHydrationRejectionSeed(value: unknown): value is HydrationRejectionSeed {
-	return (
-		value !== null && typeof value === 'object' && hasOwnProp.call(value, HYDRATION_REJECTION_SEED)
-	);
 }
 
 function recordHydrationSeed(serial: unknown[] | null, value: unknown, directSite?: string): void {
@@ -6944,14 +6710,6 @@ function recordHydrationSeed(serial: unknown[] | null, value: unknown, directSit
 
 function recordSkippedHydrationSite(serial: unknown[] | null, directSite?: string): void {
 	if (directSite !== undefined) recordHydrationSeed(serial, HYDRATION_SITE_EVENT, directSite);
-}
-
-function recordHydrationRejection(
-	serial: unknown[] | null,
-	reason: unknown,
-	directSite?: string,
-): void {
-	recordHydrationSeed(serial, hydrationRejectionSeed(reason), directSite);
 }
 
 function hasExternalHydrationOwner(thenable: PromiseLike<unknown>): boolean {
@@ -7026,10 +6784,7 @@ export function use<T>(
 		if (entryT !== undefined) {
 			// Livelock-guard consumption mark (armed only after a first strike).
 			RESOLVED.pu.touched?.add(usable as PromiseLike<unknown>);
-			if ('reason' in entryT) {
-				recordHydrationRejection(serial, entryT.reason, directSite);
-				throw entryT.reason;
-			}
+			if ('reason' in entryT) throw entryT.reason;
 			recordHydrationSeed(serial, entryT.value, directSite);
 			return entryT.value as T;
 		}
@@ -7047,13 +6802,10 @@ export function use<T>(
 				thenable.then(NOOP, NOOP);
 			} catch {}
 		}
-		// Rejected on a prior pass → throw so the enclosing @try renders @catch.
-		// Serialize a typed rejection seed first so hydration takes the same catch
-		// arm even when the client receives a fresh, still-pending thenable.
-		if ('reason' in entry) {
-			recordHydrationRejection(serial, entry.reason, directSite);
-			throw entry.reason;
-		}
+		// Rejected on a prior pass → throw. Like any render error, it ships no
+		// seed: the nearest Suspense boundary discards its seeds and its client
+		// render reads client data, as React's does.
+		if ('reason' in entry) throw entry.reason;
 		// Resolved → return it, and record it (in render order) for client seeding.
 		recordHydrationSeed(serial, entry.value, directSite);
 		return entry.value as T;
@@ -7074,10 +6826,7 @@ export function use<T>(
 		recordHydrationSeed(serial, instrumented.value, directSite);
 		return instrumented.value as T;
 	}
-	if (status === 'rejected') {
-		recordHydrationRejection(serial, instrumented.reason, directSite);
-		throw instrumented.reason;
-	}
+	if (status === 'rejected') throw instrumented.reason;
 	if (wasUninstrumented) {
 		// Track an uninstrumented thenable before deciding to suspend. A custom
 		// thenable may call either continuation synchronously; in that case the
@@ -7104,10 +6853,7 @@ export function use<T>(
 			recordHydrationSeed(serial, instrumented.value, directSite);
 			return instrumented.value as T;
 		}
-		if (status === 'rejected') {
-			recordHydrationRejection(serial, instrumented.reason, directSite);
-			throw instrumented.reason;
-		}
+		if (status === 'rejected') throw instrumented.reason;
 	}
 	if (!wasUninstrumented && typeof status === 'string') {
 		instrumented.then(NOOP, NOOP);
@@ -7116,10 +6862,7 @@ export function use<T>(
 			recordHydrationSeed(serial, instrumented.value, directSite);
 			return instrumented.value as T;
 		}
-		if (status === 'rejected') {
-			recordHydrationRejection(serial, instrumented.reason, directSite);
-			throw instrumented.reason;
-		}
+		if (status === 'rejected') throw instrumented.reason;
 	}
 	// First time we reach this site this render — record the thenable so render()'s
 	// loop can await it, then suspend so the nearest @try shows @pending this pass.
@@ -8789,7 +8532,6 @@ export function getSsrSuspenseTimeout(): number {
 
 function serializeSuspenseSeedJson(values: unknown[]): string {
 	let wireValues: unknown[] | null = null;
-	let rejections: Array<[number, HydrationRejectionPayload]> | null = null;
 	let sites: Array<[string, number]> | null = null;
 	let hasSeededSite = false;
 	for (let i = 0; i < values.length; i++) {
@@ -8810,32 +8552,17 @@ function serializeSuspenseSeedJson(values: unknown[]): string {
 			hasSeededSite = true;
 			sites.push([event[HYDRATION_SITE_EVENT], wireValues.length]);
 		}
-		if (isHydrationRejectionSeed(value)) {
-			wireValues ??= values.slice(0, i);
-			rejections ??= [];
-			rejections.push([wireValues.length, value[HYDRATION_REJECTION_SEED]]);
-			wireValues.push(null);
-		} else if (wireValues !== null) {
-			wireValues.push(value);
-		}
+		if (wireValues !== null) wireValues.push(value);
 	}
 	const actualValues = wireValues ?? values;
 	// Successful untagged seeds retain the established compact array format.
-	// Rejections and compiler-owned site outcomes use renderer-owned TOP-LEVEL
-	// metadata so fulfilled user values cannot collide with either protocol.
-	// Unseeded site outcomes matter only when a seeded site exists in the same
-	// scope; otherwise the client can safely execute every request factory.
-	const payload =
-		rejections === null && !hasSeededSite
-			? actualValues
-			: {
-					[REJECTION_SENTINEL_KEY]: {
-						version: 1,
-						values: actualValues,
-						rejections: rejections ?? [],
-						...(hasSeededSite ? { sites: sites! } : {}),
-					},
-				};
+	// Compiler-owned site outcomes use renderer-owned TOP-LEVEL metadata so
+	// fulfilled user values cannot collide with the protocol. Unseeded site
+	// outcomes matter only when a seeded site exists in the same scope;
+	// otherwise the client can safely execute every request factory.
+	const payload = !hasSeededSite
+		? actualValues
+		: { [REJECTION_SENTINEL_KEY]: { version: 2, values: actualValues, sites: sites! } };
 	const undefinedWire = SUSPENSE_SEED_WIRE_PREFIX + 'u';
 	const escapedStringWire = SUSPENSE_SEED_WIRE_PREFIX + 's';
 	return JSON.stringify(payload, (_key, value) => {
@@ -8889,8 +8616,9 @@ function serializeNativeSignalSeeds(
  * styles cross the boundary once).
  *
  * Suspense: a `use(thenable)` that hasn't resolved suspends the pass; `prerender`
- * awaits it and re-renders so the @try shows its resolved success arm (or @catch
- * on rejection), while `renderToString` (sync) leaves the @pending fallback. Each
+ * awaits it and re-renders so the @try shows its resolved success arm (or, on
+ * rejection, its @pending fallback marked for a client render), while
+ * `renderToString` (sync) leaves the @pending fallback. Each
  * resolved value is appended as an inline data `<script>` for the client to seed.
  */
 type SuspendedList = { promise: PromiseLike<unknown>; key: string }[];
@@ -9147,7 +8875,6 @@ interface Ambient {
 	susp: SuspendedList | null;
 	res: ResolvedMap | null;
 	serial: unknown[] | null;
-	serialIsolations: SerialIsolation[] | null;
 	frame: Frame | null;
 	deferred: Job[] | null;
 	comp: ServerComponent | null;
@@ -9187,7 +8914,6 @@ function saveAmbient(): Ambient {
 		susp: SUSPENDED,
 		res: RESOLVED,
 		serial: SERIAL,
-		serialIsolations: SERIAL_ISOLATIONS,
 		frame: FRAME,
 		deferred: DEFERRED,
 		comp: CURRENT_COMP,
@@ -9247,7 +8973,6 @@ function restoreAmbient(a: Ambient): void {
 	SUSPENDED = a.susp;
 	RESOLVED = a.res;
 	SERIAL = a.serial;
-	SERIAL_ISOLATIONS = a.serialIsolations;
 	FRAME = a.frame;
 	DEFERRED = a.deferred;
 	CURRENT_COMP = a.comp;
@@ -9322,7 +9047,6 @@ function runFullFramedPass(
 	FALLBACK_HOIST_DEPTH = 0;
 	const suspended = (SUSPENDED = [] as SuspendedList);
 	const serial = (SERIAL = [] as unknown[]);
-	SERIAL_ISOLATIONS = null;
 	const deferred = (DEFERRED = [] as Job[]);
 	RESOLVED = resolved;
 	CURRENT_SSR_ELEMENT = null;
@@ -9483,7 +9207,6 @@ function runDiscoveryRound(
 	FALLBACK_HOIST_DEPTH = 0;
 	const suspended = (SUSPENDED = [] as SuspendedList);
 	SERIAL = [] as unknown[];
-	SERIAL_ISOLATIONS = null;
 	const deferred = (DEFERRED = [] as Job[]);
 	RESOLVED = resolved;
 	CURRENT_SSR_ELEMENT = null;
@@ -9526,7 +9249,7 @@ function runDiscoveryRound(
 				// thenable is already queued. A REAL error is DISCARDED here, not
 				// propagated: discovery output is throwaway, and only the canonical
 				// full pass renders the real tree, where the error can unwind to its
-				// actual ancestor @catch (throwing from a discovery re-run would
+				// actual ancestor boundary (throwing from a discovery re-run would
 				// reject render() even when an ancestor boundary handles it). The
 				// error re-occurs deterministically on the final pass because its
 				// use() inputs come from the same RESOLVED cache.
@@ -10564,8 +10287,8 @@ export function renderToStaticMarkup(
 // to the surrounding pass — its real content ships ONLY via its own segment, so
 // a nested pending boundary inside a completed one swaps later by discovery
 // order (tracked separately from its opaque id). On promise rejection the next
-// pass's `use()` throws the reason, the boundary's `@catch` renders as a normal
-// segment, and a typed rejection seed makes hydration take/adopt that same arm.
+// pass's `use()` throws the reason, and the nearest Suspense boundary is marked
+// errored: its fallback stays and `$OCTRX` tells hydration to render it fresh.
 //
 // Hydration: `$OCTRC` stashes the boundary's seed JSON on `window.$OCTS[id]`
 // and leaves a `<!--oct-seed:id-->` comment where the template was; the client
@@ -10633,7 +10356,7 @@ interface StreamState {
 	activePassBoundaryKeys: Set<string> | null;
 	/** Content-arm nesting while the synchronous pass walks `ssrTry` calls. */
 	activeTryKeys: string[];
-	/** All arm owners (content/catch/fallback) while walking nested `ssrTry` calls. */
+	/** All arm owners (content/fallback) while walking nested `ssrTry` calls. */
 	activeOwnerKeys: string[];
 	/** Undo log scoped to one synchronous full pass; null between passes. */
 	replay: StreamBoundaryReplayEntry[] | null;
@@ -10731,7 +10454,7 @@ let STREAM: StreamState | null = null;
 
 // Once a boundary finalizes, only descendant entries whose template sentinel is
 // present in that FINAL segment remain reachable. A child registered while
-// rendering a fallback, or in content later replaced by an outer catch arm,
+// rendering a fallback, or in content an errored outer boundary later dropped,
 // otherwise keeps the stream pending forever after its DOM template vanished.
 // Judge direct registered ownership only; a deeper descendant belongs to its
 // nearest registered owner, whose own segment performs the next pruning step.
@@ -10779,10 +10502,10 @@ function pruneStreamBoundariesAbsentFromShell(
 }
 
 // A presentation-binding view labels a @try boundary's own range with the arm
-// it rendered (0 content, 1 pending, 2 catch). The label replaces the plain open
-// marker, so renderer hydration still sees one balanced range. Module scope keeps
+// it rendered (0 content, 1 pending). The label replaces the plain open marker,
+// so renderer hydration still sees one balanced range. Module scope keeps
 // ssrTry, which runs once per boundary per pass, free of a per-call closure.
-function ssrTryArm(content: string, arm: 0 | 1 | 2, bindingMarker: string | undefined): string {
+function ssrTryArm(content: string, arm: 0 | 1, bindingMarker: string | undefined): string {
 	return bindingMarker === undefined || !MARKERS
 		? ssrBlock(content)
 		: '<!--' + bindingMarker + arm + '-->' + content + BLOCK_CLOSE;
@@ -10796,22 +10519,23 @@ function ssrTryArm(content: string, arm: 0 | 1 | 2, bindingMarker: string | unde
  *   success            → ssrBlock(ssrBlock(tryHtml))
  *   suspend, @pending  → ssrBlock(ssrBlock(pendingHtml))
  *   suspend, no arm    → ssrBlock('')
- *   error, @catch      → ssrBlock(ssrBlock(catchHtml))
- *   error, no @catch   → rethrow for authored buffered @try; JSX Suspense and
- *                       streamed boundaries publish fallback for client recovery
- * In streaming mode a suspended boundary additionally carries the
- * `<template data-oct-b>` sentinel, and a REGISTERED boundary keeps returning
- * its pending form (content ships via its segment).
+ *   error, @pending    → the suspend form, marked for a client render
+ *   error, no @pending → rethrow
+ * React's server never runs an error boundary, so a `@catch` arm renders only
+ * on the client. A Suspense boundary reports the error (onError) and ships its
+ * fallback for the client to render; any other boundary passes the error on,
+ * so with no Suspense boundary above it the render fails. In streaming mode a
+ * suspended boundary additionally carries the `<template data-oct-b>`
+ * sentinel, and a REGISTERED boundary keeps returning its pending form
+ * (content ships via its segment, an error via its client-render instruction).
  */
 export function ssrTry(
 	scope: SSRScope,
 	siteKey: string,
 	tryFn: (arg: unknown, scope: SSRScope) => string,
 	pendFn: ((arg: unknown, scope: SSRScope) => string) | null,
-	catchFn: ((err: unknown, scope: SSRScope, reset: () => void) => string) | null,
 	namespace: 'html' | 'svg' | 'mathml' = FRAME?.namespace ?? 'html',
 	propagateSuspense = false,
-	recoverErrors = false,
 	bindingMarker?: string,
 ): string {
 	VT_SSR_TRY_SEQ++;
@@ -10828,7 +10552,7 @@ export function ssrTry(
 	}
 	const stream = STREAM;
 	// Boundary identity is needed in buffered renders too: descendants rendered
-	// at the same component position in content/pending/catch are separate client
+	// at the same component position in content/pending arms are separate client
 	// block scopes and must not share server use()/puMemo caches across passes.
 	const frame = FRAME;
 	const base = '@try:' + siteKey;
@@ -10841,7 +10565,6 @@ export function ssrTry(
 	const armScope = outerAsyncScope + '|@arm:' + siteKey + '#' + occurrence.toString(36) + ':';
 	let entry: StreamBoundary | undefined;
 	const serialStart = SERIAL?.length ?? 0;
-	const isolationStart = SERIAL_ISOLATIONS?.length ?? 0;
 	let ancestorKeys: string[] = EMPTY_SNAPSHOT_LIST;
 	let ownerKeys: string[] = EMPTY_SNAPSHOT_LIST;
 	if (stream !== null) {
@@ -10859,7 +10582,7 @@ export function ssrTry(
 			entry.owners = ownerKeys;
 		}
 	}
-	const withArmScope = <T>(arm: 'content' | 'pending' | 'catch', fn: () => T): T => {
+	const withArmScope = <T>(arm: 'content' | 'pending', fn: () => T): T => {
 		const prev = ASYNC_SCOPE;
 		ASYNC_SCOPE = armScope + arm;
 		try {
@@ -10896,18 +10619,6 @@ export function ssrTry(
 			}
 		});
 	};
-	const withCatchArm = <T>(fn: () => T): T =>
-		withArmScope('catch', () => {
-			if (stream === null) return fn();
-			stream.activeTryKeys.push(key);
-			stream.activeOwnerKeys.push(key);
-			try {
-				return fn();
-			} finally {
-				stream.activeOwnerKeys.pop();
-				stream.activeTryKeys.pop();
-			}
-		});
 	// A boundary that actually suspends owns a useId namespace derived from its
 	// opaque stream id. That keeps sibling/content IDs independent of resolution
 	// order and prevents a pending branch from shifting already-flushed shell IDs.
@@ -10928,23 +10639,18 @@ export function ssrTry(
 	};
 	if (entry !== undefined) enterBoundaryIds(0);
 	let nativeFresh = false;
-	// A fresh arm the server could not finish, which the client reports once.
-	let clientArm = false;
+	// A fresh arm's marker. The client reports once an arm the server could not
+	// finish because it suspended or threw.
+	let freshArm = NATIVE_SIGNAL_FRESH_COMMENT;
 	const nativeFailureStart = NATIVE_SERVER_FAILURES;
 	const nativeFreshArm = (inner: string): string => {
 		if (!MARKERS || !nativeFresh) return inner;
 		// This body cannot be replayed from ready values alone. Remove its
 		// positional seeds too; the fresh client body must not shift a sibling's
 		// use() cursor. Its original useId range remains reserved by the marker.
-		rewindSerial(serialStart, isolationStart);
+		rewindSerial(serialStart);
 		const idCount = Math.max(0, ID_COUNTER - (boundaryIds ? 0 : outerIdCounter));
-		return (
-			'<!--' +
-			(clientArm ? CLIENT_RENDER_ARM_COMMENT : NATIVE_SIGNAL_FRESH_COMMENT) +
-			idCount +
-			'-->' +
-			inner
-		);
+		return '<!--' + freshArm + idCount + '-->' + inner;
 	};
 	const pendingForm = (): string => {
 		// A ViewTransition at the top of the FALLBACK arm exits when the boundary
@@ -10985,7 +10691,6 @@ export function ssrTry(
 			if (nativeCapture < 0) NATIVE_SERVER_READS = null;
 			const deferredStart = DEFERRED?.length ?? 0;
 			const serialStart = SERIAL?.length ?? 0;
-			const isolationStart = SERIAL_ISOLATIONS?.length ?? 0;
 			const css = CSS;
 			const cssSnapshot = snapshotStyles(css);
 			const head = HEAD;
@@ -11014,7 +10719,7 @@ export function ssrTry(
 				finishNativeSeedCapture(nativeCapture, previousNativeReads, false);
 				if (SUSPENDED !== null) SUSPENDED.length = suspendedStart;
 				if (DEFERRED !== null) DEFERRED.length = deferredStart;
-				rewindSerial(serialStart, isolationStart);
+				rewindSerial(serialStart);
 				if (css !== null && cssSnapshot !== null) {
 					css.replay = null;
 					css.clear();
@@ -11147,7 +10852,7 @@ export function ssrTry(
 				if (stream !== null) {
 					// Drop seeds pushed by the partially-rendered body — they belong to
 					// the boundary's own slice once it completes.
-					rewindSerial(serialStart, isolationStart);
+					rewindSerial(serialStart);
 					if (entry === undefined) {
 						const pendingIdOffset = Math.max(0, ID_COUNTER - outerIdCounter);
 						restoreOuterIds();
@@ -11178,74 +10883,18 @@ export function ssrTry(
 					// its @pending arm goes out marked for a client render, as React
 					// marks a boundary it could not finish (`<!--$!-->`). A
 					// presentation-binding view adopts its pending arm instead.
-					nativeFresh = clientArm = true;
+					nativeFresh = true;
+					freshArm = CLIENT_RENDER_ARM_COMMENT;
 				}
 				return pendingForm();
 			}
-			if (catchFn !== null) {
-				// Preserve values consumed before the rejection plus its typed rejection
-				// record. The client replays that exact seed order, throws at the same
-				// use(), then hydrates the already-streamed catch arm (whose own use() calls
-				// consume any seeds appended while rendering it below). The replay adopts
-				// no DOM, so a nested boundary in the body reads positional seeds, not
-				// the sidecar this arm discards: return its run to the stream first.
-				restoreSerialIsolations(isolationStart);
-				// A buffered body's seeds stay in the root stream; a streamed one's
-				// travel in its own segment. Either way the catch arm's follow them.
-				const tryRun = entry === undefined ? null : isolateSerial(serialStart);
-				const catchStart = SERIAL?.length ?? serialStart;
-				const trySeeds =
-					tryRun === null
-						? catchStart - serialStart
-						: entry?.serverOwnedStatic === true
-							? 0
-							: tryRun.length;
-				const nativeCapture = NATIVE_READ_COLLECTOR?.beginCapture() ?? -1;
-				const previousNativeReads = NATIVE_SERVER_READS;
-				if (nativeCapture < 0) NATIVE_SERVER_READS = null;
-				let catchReads: NativeSeedReads | null = null;
-				let inner: string;
-				try {
-					inner = ssrBlock(withCatchArm(() => catchFn(e, scope, NOOP)));
-				} finally {
-					catchReads = finishNativeSeedCapture(nativeCapture, previousNativeReads, false);
-				}
-				// Tell the client this range is the caught arm, so it replays the try
-				// body without adopting and then adopts the catch arm. A static
-				// boundary ships no seeds; a native-fresh arm is rebuilt instead.
-				if (MARKERS && !nativeFresh) {
-					const catchSeeds =
-						SERIAL === null || entry?.serverOwnedStatic === true ? 0 : SERIAL.length - catchStart;
-					inner = `<!--${TRY_CATCH_COMMENT}${trySeeds}:${catchSeeds}-->` + inner;
-				}
-				inner = nativeFreshArm(inner);
-				if (entry !== undefined) {
-					if (entry.state !== 'done') {
-						if (!entry.serverOwnedStatic && !nativeFresh)
-							entry.signals = NATIVE_READ_COLLECTOR?.serialize(
-								catchReads,
-								RESOLVED?.initialDocumentSignals,
-							);
-						const catchRun = isolateSerial(serialStart);
-						entry.state = 'done';
-						entry.html = inner;
-						entry.rawHtml = VT_SSR_HAS_RAW_HTML;
-						entry.seeds = nativeFresh || entry.serverOwnedStatic ? [] : tryRun!.concat(catchRun);
-						pruneUnrepresentedStreamDescendants(stream!, key, entry.html);
-					} else {
-						isolateSerial(serialStart);
-					}
-					ID_COUNTER = entry.pendingIdOffset;
-					return pendingForm();
-				}
-				if (!nativeFresh) appendNativeSeedReads(catchReads);
-				return ssrTryArm(inner, 2, bindingMarker);
-			}
+			// Only a Suspense boundary, or one that already registered, recovers.
+			if (pendFn === null && entry === undefined) throw e;
 			if (stream !== null) {
 				// Fizz keeps a Suspense shell valid when its primary content throws:
 				// publish the fallback, report the error, and mark this boundary for a
-				// client render. Buffered JSX Suspense uses a fresh-arm marker below.
-				rewindSerial(serialStart, isolationStart);
+				// client render. A buffered boundary uses a fresh-arm marker below.
+				rewindSerial(serialStart);
 				if (entry === undefined && PERMANENT_STATIC_HYDRATE_DEPTH !== 0) throw e;
 				if (entry === undefined) {
 					const pendingIdOffset = Math.max(0, ID_COUNTER - outerIdCounter);
@@ -11282,14 +10931,16 @@ export function ssrTry(
 				pruneUnrepresentedStreamDescendants(stream, key, fallback);
 				return fallback;
 			}
-			if (recoverErrors && pendFn !== null && PERMANENT_STATIC_HYDRATE_DEPTH === 0) {
+			if (PERMANENT_STATIC_HYDRATE_DEPTH === 0) {
 				// A buffered Suspense boundary can retry on hydration just like a
 				// streamed boundary. Discard failed-content seeds and mark only this
 				// arm for a fresh client render; surrounding server hosts still adopt.
-				rewindSerial(serialStart, isolationStart);
+				// A presentation-binding view rebuilds the arm without a report.
+				rewindSerial(serialStart);
 				const reports = RESOLVED?.bufferedErrors ?? (RESOLVED!.bufferedErrors = new Map());
 				if (!reports.has(key)) reports.set(key, { error: e, reported: false });
 				nativeFresh = true;
+				if (bindingMarker === undefined) freshArm = CLIENT_ERROR_ARM_COMMENT;
 				return pendingForm();
 			}
 			throw e;

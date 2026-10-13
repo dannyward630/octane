@@ -45,15 +45,6 @@ export const HYDRATION_FOR_ITEMS = '[f1';
 /** Index of the arm digit ('0' or '1') inside either @for outer-open payload. */
 export const HYDRATION_FOR_ARM_INDEX = HYDRATION_FOR_PREFIX.length;
 
-/**
- * Leads a `@try` arm range that holds the server's `@catch` arm:
- * `<!--oct-catch:T:C-->`, where T and C count the positional `use()` seeds the
- * abandoned try body and the catch arm left in the seed stream. Without it a
- * client cannot tell a caught arm from a successful one, so it would adopt the
- * catch DOM as try-body content.
- */
-export const TRY_CATCH_COMMENT = 'oct-catch:';
-
 /** Leads a resolved `@try` arm whose server render reserved sequential IDs. */
 export const SUSPENSE_RESOLVED_COMMENT = 'oct-suspense:';
 /** Comment-data prefix left in a swapped boundary for hydration seed scoping. */
@@ -69,6 +60,13 @@ export const NATIVE_SIGNAL_FRESH_COMMENT = 'oct-native-fresh:';
  * reports it once.
  */
 export const CLIENT_RENDER_ARM_COMMENT = 'oct-client:';
+/**
+ * Leads the `@pending` arm of a Suspense boundary whose buffered server render
+ * threw (`<!--oct-client-error:N-->`, N as above). React's server never runs an
+ * error boundary, so the client renders the boundary fresh, where its own
+ * `@catch` arm can take a repeated throw, and reports it once.
+ */
+export const CLIENT_ERROR_ARM_COMMENT = 'oct-client-error:';
 
 /**
  * Serialize one `useId()` value. The client regenerates the id the server

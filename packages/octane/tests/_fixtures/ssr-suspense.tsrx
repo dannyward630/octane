@@ -271,9 +271,8 @@ export function AsyncComponentBoundary(props) @{
 	</div>
 }
 
-// Rejection hydration fidelity probe. The catch arm observes both the original
-// reason type and custom fields, so streamed hydration cannot silently replace
-// a primitive/plain-object reason with a generic Error.
+// The catch arm observes both the reason's type and custom fields, so a client
+// render cannot silently replace a primitive or plain-object reason.
 export function ReasonBoundary(props) @{
 	<div id="reason-box">
 		@try {
@@ -294,24 +293,8 @@ export function ReasonBoundary(props) @{
 	</div>
 }
 
-// A catch arm that never inspects the reason lets opaque/revoked objects prove
-// that rejection transport itself is exception-safe.
-export function OpaqueReasonBoundary(props) @{
-	<div id="opaque-reason-box">
-		@try {
-			use(props.promise);
-			<span class="opaque-reason-ok">{'ok'}</span>
-		} @pending {
-			<span class="opaque-reason-loading">{'loading'}</span>
-		} @catch (err) {
-			props.onCatch?.(err);
-			<span class="opaque-reason-error">{'caught'}</span>
-		}
-	</div>
-}
-
-// A fulfilled value deliberately shaped like the former in-band rejection
-// sentinel. Hydration must treat it as ordinary user data.
+// A fulfilled value deliberately shaped like the seed envelope. Hydration must
+// treat it as ordinary user data.
 export function SeedCollision(props) @{
 	const value = use(props.promise);
 	props.onValue?.(value);
@@ -324,8 +307,8 @@ export function SeedCollision(props) @{
 	</div>
 }
 
-// The inner boundary has no catch arm. A hydrated rejection must retain its
-// private adoption signal while bubbling, then unwrap only for the outer catch.
+// The inner boundary has no catch arm, but it is the Suspense boundary nearest
+// a rejection, so only it renders on the client.
 export function NestedRejectionBoundary(props) @{
 	<div id="nested-rejection">
 		@try {
@@ -344,8 +327,8 @@ export function NestedRejectionBoundary(props) @{
 }
 
 // Wayfinder-shaped streamed rejection: the try arm calls a factory through
-// use(), so the compiler emits seedOrCreate. Hydration must adopt the streamed
-// @catch DOM instead of minting a second alert beside it.
+// use(), so the compiler emits seedOrCreate. The client renders the boundary
+// and its one alert from its own request.
 async function loadFactoryForecast(scenario: string, attempt: number): Promise<string> {
 	await Promise.resolve();
 	if (scenario === 'weather-failure' && attempt === 0) {
@@ -381,9 +364,7 @@ export function FactoryRejectionBoundary(props: { scenario: string }) @{
 	</section>
 }
 
-// The inner catch deliberately rethrows the raw reason. Hydration must retain
-// its private adoption token while unwinding so the outer catch can claim the
-// already-rendered server range without exposing the token to user code.
+// The inner catch deliberately rethrows the raw reason to the outer catch.
 export function RethrowingNestedRejectionBoundary(props) @{
 	<div id="nested-rethrow-rejection">
 		@try {

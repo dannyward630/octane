@@ -27,7 +27,6 @@ import {
 	NATIVE_SIGNAL_FRESH_COMMENT,
 	STREAM_SEED_COMMENT,
 	SUSPENSE_RESOLVED_COMMENT,
-	TRY_CATCH_COMMENT,
 } from './hydration-markers.js';
 import { moveNativeNodeBefore } from './dom-focused-move.js';
 import { rendererRangeClose, STREAM_BOUNDARY_ATTR } from './stream-protocol.js';
@@ -967,7 +966,7 @@ function adoptRegion(region: RegionInstance, id: string, transaction: Transactio
 /**
  * The server wraps its `@try` output in this region and records the arm it
  * rendered. Renderer protocol nodes may precede that arm's own range: resolved
- * seeds, a catch receipt, or a streamed boundary. A pending boundary that is
+ * seeds or a streamed boundary. A pending boundary that is
  * still streaming is claimed here, exactly as the renderer claims it, so its
  * late segment can no longer swap into binding-owned DOM. An arm the server could
  * not render for adoption is rebuilt by the first commit.
@@ -999,9 +998,7 @@ function adoptTry(
 		const data = (node as Comment).data;
 		if (data.startsWith(NATIVE_SIGNAL_FRESH_COMMENT)) arm = -2;
 		else if (data.startsWith(STREAM_SEED_COMMENT)) arm = 0;
-		else if (data.startsWith(TRY_CATCH_COMMENT)) {
-			if (arm !== -2) arm = 2;
-		} else if (!data.startsWith(SUSPENSE_RESOLVED_COMMENT)) break;
+		else if (!data.startsWith(SUSPENSE_RESOLVED_COMMENT)) break;
 		node = node.nextSibling;
 	}
 	region.arm = arm;
@@ -1395,10 +1392,9 @@ function prepareTry(
 			transaction.refresh!();
 		});
 	};
-	// A catch arm is kept for its error. An adopted server catch arm has none
-	// yet, so the first client failure takes over its DOM instead of rebuilding it.
+	// A catch arm is kept for its error.
 	candidate.child = prepareFragment(
-		region.arm === 2 && region.child && (region.caught === caught || region.caught === undefined)
+		region.arm === 2 && region.child && region.caught === caught
 			? region.child
 			: createFragment(descriptor.arms[2]!, instance.id, document, transaction),
 		environment.concat([caught.error, region.reset]),

@@ -1957,7 +1957,8 @@ export function App(p) @{
 			dev: false,
 		});
 		expect(server?.code).toContain('_$ssrTry(');
-		expect(server?.code).toContain('(__error, __scope, __reset) =>');
+		// The server never renders the fallback, so it compiles none.
+		expect(server?.code).not.toContain('button');
 		expect(server?.code).toContain(', undefined, true)');
 		expect(server?.code).not.toContain('ErrorBoundary');
 

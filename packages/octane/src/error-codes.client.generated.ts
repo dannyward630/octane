@@ -34,7 +34,6 @@ type ClientErrorArguments = {
 	20: [];
 	21: [];
 	22: [];
-	23: [];
 	24: [unknown];
 	25: [];
 	26: [unknown];
@@ -314,6 +313,7 @@ type ClientErrorArguments = {
 	341: [];
 	342: [];
 	343: [];
+	344: [];
 };
 
 export function formatClientError<Code extends keyof ClientErrorArguments>(
@@ -423,8 +423,6 @@ export function formatClientError<Code extends keyof ClientErrorArguments>(
 				);
 			case 22:
 				return formatDevErrorMessage('A renderer-owned DOM region requires a live DOM root.', args);
-			case 23:
-				return formatDevErrorMessage('Server-rendered use() rejected', args);
 			case 24:
 				return formatDevErrorMessage(
 					'Element type is invalid: expected a string (for a built-in element) or a function (for a component), but got: %s.',
@@ -1368,6 +1366,11 @@ export function formatClientError<Code extends keyof ClientErrorArguments>(
 			case 343:
 				return formatDevErrorMessage(
 					'A keyed list rollback record restored a different shape than it recorded. This is a bug in Octane.',
+					args,
+				);
+			case 344:
+				return formatDevErrorMessage(
+					'The server could not finish this Suspense boundary, likely due to an error during server rendering. Switched to client rendering.',
 					args,
 				);
 			default:

@@ -16679,43 +16679,15 @@ function ssrEmitTry(node, ctx, name, inlinedSubs, parentNs, cssHash, componentNs
 		registerClauseOrigin(ctx, node.pendingKeyword, [pendSub.fnName]);
 		pendFn = inheritOriginLoc(b.id(pendSub.fnName), node.pendingKeyword ?? node.pending);
 	}
-	let catchFn = inheritOriginLoc(b.literal(null), node); // no @catch → rethrow
-	if (node.handler) {
-		const params = [];
-		if (node.handler.param) params.push(node.handler.param);
-		if (node.handler.resetParam) params.push(node.handler.resetParam);
-		const catchSub = ssrCompileSub(
-			node.handler.body.body,
-			ctx,
-			'__scatch',
-			params,
-			cssHash,
-			parentNs,
-			componentNs,
-		);
-		inlinedSubs.push(catchSub.fn);
-		// A no-param @catch simply ignores the error argument ssrTry passes.
-		// ssrTry keeps the SSR scope second; adapt the authored reset parameter
-		// around that ABI instead of shifting existing one-parameter helpers.
-		registerClauseOrigin(ctx, node.handlerKeyword, [catchSub.fnName]);
-		const catchOrigin = node.handlerKeyword ?? node.handler;
-		catchFn = node.handler.resetParam
-			? inheritOriginLoc(
-					b.arrow(
-						[b.id('__error'), b.id('__scope'), b.id('__reset')],
-						b.call(catchSub.fnName, b.id('__error'), b.id('__reset'), b.id('__scope')),
-					),
-					catchOrigin,
-				)
-			: inheritOriginLoc(b.id(catchSub.fnName), catchOrigin);
-	}
 	registerDirectiveOrigin(ctx, node, ['_$ssrTry', trySub.fnName]);
 	ctx.runtimeNeeded.add('ssrTry');
 	// SSR @try routes through the runtime ssrTry helper: a `use(thenable)`
 	// suspension renders the @pending fallback (plus, in STREAMING renders, the
-	// boundary registration + `<template data-oct-b>` sentinel); any other thrown
-	// error renders @catch (or rethrows). Output is byte-identical to the old
-	// inline try/catch emit for buffered renders (hydration compatibility).
+	// boundary registration + `<template data-oct-b>` sentinel). As React's server
+	// never runs an error boundary, the @catch arm is client-only: any other
+	// thrown error marks a @pending boundary for a client render, or rethrows.
+	// Output is byte-identical to the old inline try/catch emit for buffered
+	// renders (hydration compatibility).
 	// `siteKey` is a stable source-position hash so a boundary keeps its identity
 	// across streaming passes (the runtime adds the frame path per instance).
 	const trailing = [];
@@ -16734,12 +16706,10 @@ function ssrEmitTry(node, ctx, name, inlinedSubs, parentNs, cssHash, componentNs
 	if (node.propagateSuspense === true || bindingSite !== null) {
 		trailing.push(inheritOriginLoc(b.literal(node.propagateSuspense === true), node));
 	}
-	if (bindingSite !== null) {
-		trailing.push(inheritOriginLoc(b.literal(false), node), bindingSite);
-	}
+	if (bindingSite !== null) trailing.push(bindingSite);
 	return ssrCall(
 		'ssrTry',
-		[b.id('__s'), b.literal(ssrTryKey(node)), b.id(trySub.fnName), pendFn, catchFn, ...trailing],
+		[b.id('__s'), b.literal(ssrTryKey(node)), b.id(trySub.fnName), pendFn, ...trailing],
 		node,
 	);
 }
