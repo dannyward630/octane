@@ -44,6 +44,7 @@ function createNativeReadCandidateSource(candidate: NativeReadSource) {
 				? target?.serialize?.(accepted ? canonicalVersion : version)
 				: undefined;
 		},
+		retired: () => target?.retired?.() === true,
 	};
 	if (candidate.inspect) source.inspect = () => target!.inspect!();
 	return {

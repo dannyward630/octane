@@ -1912,12 +1912,13 @@ function inspectNativeReadScope(
 	scope: import('./devtools-hook.js').DevtoolsScopeLike,
 ): import('./devtools-hook.js').DevtoolsNativeReadInspection | null {
 	const current = scope as Scope;
-	const inspection = NATIVE_READ_DRIVER?.inspectScope(current);
+	// Installed only in profiling builds, where the driver and retries inspect.
+	const inspection = NATIVE_READ_DRIVER?.inspectScope!(current);
 	const block = inspection?.block ?? current.block;
 	const retry =
-		NATIVE_BLOCK_RETRIES?.get(block)?.inspect() ??
+		NATIVE_BLOCK_RETRIES?.get(block)?.inspect!() ??
 		(block.idState.renderOwner?.current === block
-			? block.idState.renderOwner.nativeRetry?.inspect()
+			? block.idState.renderOwner.nativeRetry?.inspect!()
 			: undefined) ??
 		[];
 	if (inspection == null && retry.length === 0) return null;

@@ -152,7 +152,12 @@ export interface NativeReadSource {
 	subscribe(notify: () => void): () => void;
 	/** Ready values from the observed revision, without running computations. */
 	serialize?(observedVersion: number): readonly NativeSerializedScope[] | undefined;
-	/** On-demand metadata for a currently referenced source, with no global graph registry. */
+	/** Whether the data scope this source reads has retired. Never evaluates. */
+	retired?(): boolean;
+	/**
+	 * On-demand DevTools metadata for a currently referenced source, with no
+	 * global graph registry. Present only in profiling builds.
+	 */
 	inspect?(): NativeReadInspection;
 }
 

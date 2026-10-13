@@ -84,6 +84,8 @@ export type { SignalCandidateFrame, CandidatePreparation } from './transition-ca
 
 export type SignalReadMode = 'value' | 'latest' | 'snapshot';
 
+declare const __OCTANE_PROFILE_ENABLED__: boolean;
+
 // Dependency graph algorithms adapted from Alien Signals 3.2.1 (MIT), Johnson Chu.
 // Upstream: stackblitz/alien-signals@8734d386d925025d0e99419bd9161c17b112c5ee, src/system.ts.
 // The package LICENSE includes the upstream copyright and permission notice.
@@ -871,7 +873,11 @@ function createGraphSource(node: ScopedNode, read: SignalReadMode): NativeReadSo
 		},
 		serialize: (revision) =>
 			node.revision === revision ? node.owner.serializeRead(node, read) : undefined,
-		inspect: () => inspectNativeNode(node, read),
+		retired: () => node.owner.retired,
+		inspect:
+			typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__
+				? () => inspectNativeNode(node, read)
+				: undefined,
 	};
 }
 
@@ -1349,7 +1355,12 @@ function createViewSource(
 					? canonical().serialize?.(record.canonicalRevision)
 					: undefined
 				: own.serialize?.(version),
-		inspect: () => (record.promoted ? canonical() : own).inspect!(),
+		// The view and its canonical cell share one owner.
+		retired: own.retired,
+		inspect:
+			typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__
+				? () => (record.promoted ? canonical() : own).inspect!()
+				: undefined,
 	};
 }
 

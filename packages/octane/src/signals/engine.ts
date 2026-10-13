@@ -70,6 +70,8 @@ import type {
 	WritableSignal,
 } from './types.js';
 
+declare const __OCTANE_PROFILE_ENABLED__: boolean;
+
 interface DecodedSeedEntry {
 	readonly entry: SignalSeedEntry;
 	readonly value: unknown;
@@ -533,28 +535,32 @@ class AdoptionFrameImpl implements AdoptionFrame {
 					subscribers.add(notify);
 					return () => subscribers.delete(notify);
 				},
-				inspect: () => {
-					// Look up metadata on demand instead of capturing the seed payload
-					// in a source that a renderer may still hold after lease release.
-					const presented = this.ended
-						? undefined
-						: presentedSeed(this.data.entries, node.key, read);
-					return {
-						...inspectNativeNode(node, read),
-						status: presented
-							? presented.entry.available === false
-								? 'pending'
-								: 'ready'
-							: 'unevaluated',
-						revision: this.ended ? 1 : 0,
-						historical: true,
-						retained: !!presented && presented.entry.available !== false,
-						refreshing: presented?.entry.refreshing ?? false,
-						connection: presented?.entry.connection ?? 'none',
-						complete: presented?.entry.complete ?? false,
-						dependencies: [],
-					};
-				},
+				retired: () => node.owner.retired,
+				inspect:
+					typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__
+						? () => {
+								// Look up metadata on demand instead of capturing the seed payload
+								// in a source that a renderer may still hold after lease release.
+								const presented = this.ended
+									? undefined
+									: presentedSeed(this.data.entries, node.key, read);
+								return {
+									...inspectNativeNode(node, read),
+									status: presented
+										? presented.entry.available === false
+											? 'pending'
+											: 'ready'
+										: 'unevaluated',
+									revision: this.ended ? 1 : 0,
+									historical: true,
+									retained: !!presented && presented.entry.available !== false,
+									refreshing: presented?.entry.refreshing ?? false,
+									connection: presented?.entry.connection ?? 'none',
+									complete: presented?.entry.complete ?? false,
+									dependencies: [],
+								};
+							}
+						: undefined,
 			};
 			this.sources.set(channel, source);
 		} else if (source.node !== node) source.node = null;
