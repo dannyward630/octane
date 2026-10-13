@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
-import { flushSync, hydrateRoot } from '../../src/index.js';
+import { act, hydrateRoot } from '../../src/index.js';
 import * as ServerRT from 'octane/server';
 import { loadServerFixture } from '../_server-fixture';
 import * as client from './_fixtures/render-phase-text.tsrx';
@@ -58,7 +58,7 @@ async function hydrate(
 	expect(ownText(serverP)).toBe(serverText);
 	const recovered: unknown[] = [];
 	let root!: ReturnType<typeof hydrateRoot>;
-	flushSync(() => {
+	await act(() => {
 		root = hydrateRoot(
 			container,
 			client[name] as any,
@@ -66,7 +66,6 @@ async function hydrate(
 			{ onRecoverableError: (error) => recovered.push(error) },
 		);
 	});
-	await Promise.resolve();
 	const warnings = () =>
 		errors.mock.calls
 			.map((call) => String(call[0]))

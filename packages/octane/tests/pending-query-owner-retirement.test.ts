@@ -59,6 +59,8 @@ it.each(modes)(
 				await prerender(Server, { ...props, id: 'server', load: async () => 'server' })
 			).html;
 			root = hydrateRoot(container, App, props);
+			// The Suspense arm, whose query this test follows, hydrates after the shell.
+			await act(() => {});
 		} else {
 			root = createRoot(container);
 			root.render(App, props);

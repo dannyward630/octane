@@ -1384,8 +1384,8 @@ physically-moved nodes can differ.
 ## Scheduler: synchronous, two priorities
 
 Renders run to completion — no lanes beyond the two priorities, yields,
-time-slicing, expiration, or selective hydration. Urgent renders are
-microtask-batched. Priority changes Suspense behavior, and where the render runs:
+time-slicing, or expiration. Urgent renders are microtask-batched. Priority
+changes Suspense behavior, and where the render runs:
 
 ```tsx
 setPage(next); // If it suspends, show the pending fallback.
@@ -1438,6 +1438,13 @@ that arrive before the task runs only change the value it renders, so a fast typ
 skipped values never render deferred. There is still no time-slicing: once a
 transition or deferred render starts it runs to completion, and a keystroke that
 arrives during it waits until it commits, where React would yield to handle it.
+
+Hydration yields at Suspense boundaries, as React's does. `hydrateRoot` adopts
+the shell in one task and leaves every Suspense boundary the server resolved for
+later host tasks, which hydrate at least one boundary each and continue while the
+shared ~5 ms host budget lasts (see [Hydration](#hydration)). A boundary is
+still atomic, so the largest one sets the longest task, and a root without
+Suspense boundaries hydrates in a single task, in React too.
 
 Ready query and asynchronous `derived$` publications coalesce native component
 rendering in the same host-task queue. Source subscriptions, graph effects, and
@@ -2011,7 +2018,8 @@ Suspense like Fizz, with these differences:
 
 - Octane performs per-round re-passes (the prerender cost model), not
   per-boundary incremental renders.
-- There is no selective hydration.
+- Completed boundaries hydrate after the shell, and an interaction hydrates the
+  boundary it targets first (see [Hydration](#hydration)).
 - Head elements hoisted inside streamed boundaries are re-created on the client
   during hydration.
 
@@ -2081,6 +2089,32 @@ As in React:
 - A suspension while hydrating keeps the server HTML; it never causes a
   fallback.
 
+Suspense boundaries hydrate after the shell, as in React 19. `hydrateRoot`
+adopts everything outside them and commits, so the shell's effects run before
+any boundary's. Each Suspense boundary the server resolved keeps its server
+DOM until its turn in a later host task, in the order hydration reached them:
+an outer boundary before the boundaries inside it. Effects run in that order
+too. A boundary hydrates before its turn when:
+
+- a discrete interaction (a click, a key, a focus, an IME composition, input)
+  targets it. Octane hydrates it, and any pending boundary around it, before
+  the event reaches the root, so its handlers receive the original event.
+  React does the same for a discrete event.
+- new inputs reach it from a parent render. It hydrates from the inputs its
+  server HTML was rendered with, then renders the update over the adopted DOM,
+  as React's selective hydration does. A parent render that passes it the same
+  inputs leaves it waiting.
+
+A context value that changes before a boundary's turn is the exception: Octane
+hydrates the boundary with the new value, and any server content that differs
+falls back without a report, where React hydrates with the old value first.
+`act()` hydrates every waiting boundary, so a test that asserts a boundary's
+effects or handlers right after `hydrateRoot` needs `await act()`. A
+`<Hydrate>` island's content hydrates when the island activates, by its own
+strategy; Suspense boundaries inside it then follow the same rule. A root that
+unmounts before a boundary's turn removes the boundary's server DOM but not
+the `<head>` entries it hoisted, which it never claimed.
+
 A boundary that falls back renders from client data. The `use()` values its
 attempt read from the server's seeds are discarded, and so is captured
 interaction intent whose target was in the discarded DOM. An early host
@@ -2088,9 +2122,10 @@ binding (`adoptBindings`, a behavior root) whose server DOM lies in a
 boundary that falls back loses it: its lease ends when the fallback commits,
 its cleanup runs once, and it stops writing, even if its host was moved
 elsewhere while the boundary was pending. A boundary whose captures changed
-before it activated (a dormant `<Hydrate>` island) falls back without a
-report when its server content differs, as React reports nothing for an
-update that reaches a dehydrated boundary.
+before it activated (a dormant `<Hydrate>` island, or a Suspense boundary
+whose context changed before its turn) falls back without a report when its
+server content differs, as React reports nothing for an update that reaches a
+dehydrated boundary.
 
 Two differences are intentional. Matching React exactly would mean shipping
 and running a structural comparison of everything hydration adopts, which is

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { act, createRoot, flushSync, hydrateRoot } from '../../src/index.js';
+import { act, createRoot, flushSync, hydrateRoot, type Root } from '../../src/index.js';
 import { condition, load } from 'octane/hydration';
 import * as ServerRT from 'octane/server';
 import { loadCompiledFixtureSource, loadServerFixture } from '../_server-fixture';
@@ -148,14 +148,21 @@ describe.each([
 		}).html;
 	}
 
-	function hydrate(component: string, props: Record<string, unknown>, recovered: unknown[]) {
-		const root = hydrateRoot(
-			container,
-			client[component],
-			{ text: null, later: null, ...props },
-			{ onRecoverableError: (error) => recovered.push(error) },
-		);
-		flushSync(() => {});
+	/** Hydrate, including the Suspense arms that hydrate after the shell. */
+	async function hydrate(
+		component: string,
+		props: Record<string, unknown>,
+		recovered: unknown[],
+	): Promise<Root> {
+		let root!: Root;
+		await act(() => {
+			root = hydrateRoot(
+				container,
+				client[component],
+				{ text: null, later: null, ...props },
+				{ onRecoverableError: (error) => recovered.push(error) },
+			);
+		});
 		return root;
 	}
 
@@ -183,7 +190,7 @@ describe.each([
 			const main = container.querySelector('main')!;
 			const serverNodes = armNodes(container);
 			const recovered: unknown[] = [];
-			const root = hydrate('Hole', { kind: next, v: 'A' }, recovered);
+			const root = await hydrate('Hole', { kind: next, v: 'A' }, recovered);
 			try {
 				await expectArmFallback(main, serverNodes, 'Hole', { kind: next, v: 'A' });
 				await expectReported(recovered);
@@ -209,7 +216,7 @@ describe.each([
 			const main = container.querySelector('main')!;
 			const serverNodes = armNodes(container);
 			const recovered: unknown[] = [];
-			const root = hydrate(row.component, { rows: row.client }, recovered);
+			const root = await hydrate(row.component, { rows: row.client }, recovered);
 			try {
 				await expectArmFallback(main, serverNodes, row.component, { rows: row.client });
 				await expectReported(recovered);
@@ -233,7 +240,7 @@ describe.each([
 			const section = container.querySelector('section')!;
 			const serverNodes = contentNodes(section);
 			const recovered: unknown[] = [];
-			const root = hydrate('Hole', { kind: next, v: 'A' }, recovered);
+			const root = await hydrate('Hole', { kind: next, v: 'A' }, recovered);
 			try {
 				expect(container.querySelector('section')).toBe(section);
 				const nodes = contentNodes(section);
@@ -249,7 +256,7 @@ describe.each([
 			serverRender(component, { rows: ['a', 'b', 'c'] });
 			const rows = [...container.querySelectorAll('li')];
 			const recovered: unknown[] = [];
-			const root = hydrate(component, { rows: ['a', 'b', 'c'] }, recovered);
+			const root = await hydrate(component, { rows: ['a', 'b', 'c'] }, recovered);
 			try {
 				const hydrated = container.querySelectorAll('li');
 				expect(hydrated).toHaveLength(3);
@@ -339,7 +346,7 @@ describe.each([
 			const serverNodes = armNodes(container);
 			const pending = deferred();
 			const recovered: unknown[] = [];
-			const root = hydrate(
+			const root = await hydrate(
 				row.component,
 				{ ...row.client, [row.wait]: pending.promise },
 				recovered,

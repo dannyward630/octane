@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import * as RT from 'octane/server';
 import type { StreamOptions } from 'octane/server';
 import { prerender, type RenderOptions } from 'octane/static';
-import { hydrateRoot, flushSync } from '../src/index.js';
+import { act, hydrateRoot, flushSync } from '../src/index.js';
 import { TRY_CATCH_COMMENT } from '../src/hydration-markers.js';
 import {
 	Boundary as ClientBoundary,
@@ -49,7 +49,7 @@ const CAUGHT = (trySeeds: number, catchSeeds: number) =>
 const seed = (json: string) =>
 	`<script type="application/json" data-octane-suspense>${json}</script>`;
 
-function expectSeededHydration(
+async function expectSeededHydration(
 	html: string,
 	body: Parameters<typeof hydrateRoot>[1],
 	props: Record<string, unknown>,
@@ -61,7 +61,8 @@ function expectSeededHydration(
 	const hosts = [...container.querySelectorAll('*:not(script)')];
 	const root = hydrateRoot(container, body, props);
 	try {
-		flushSync(() => {});
+		// The Suspense arms, and the seeds they consume, hydrate after the shell.
+		await act(() => {});
 		expect([...container.querySelectorAll('*:not(script)')]).toEqual(hosts);
 		expect(container.innerHTML.replace(/<!--[\s\S]*?-->/g, '')).toBe(expected);
 	} finally {
@@ -1274,7 +1275,7 @@ export function App(props) @{
 
 	it('@try awaits use(promise) and renders the resolved success arm + seed', async () => {
 		const out = await prerender(m.Boundary, { promise: Promise.resolve('hi') });
-		expectSeededHydration(
+		await expectSeededHydration(
 			out.html,
 			ClientBoundary,
 			{ promise: clientPending() },
@@ -1302,7 +1303,7 @@ export function App(props) @{
 			outer: Promise.resolve('O'),
 			inner: Promise.resolve('I'),
 		});
-		expectSeededHydration(
+		await expectSeededHydration(
 			out.html,
 			ClientNested,
 			{ outer: clientPending(), inner: clientPending() },
@@ -1315,7 +1316,7 @@ export function App(props) @{
 			a: Promise.resolve('A'),
 			b: Promise.resolve('B'),
 		});
-		expectSeededHydration(
+		await expectSeededHydration(
 			out.html,
 			ClientSiblings,
 			{ a: clientPending(), b: clientPending() },
@@ -1329,7 +1330,7 @@ export function App(props) @{
 			outer: Promise.resolve('first'),
 			inner: Promise.resolve('second'),
 		});
-		expectSeededHydration(
+		await expectSeededHydration(
 			out.html,
 			ClientNested,
 			{ outer: clientPending(), inner: clientPending() },
@@ -1359,7 +1360,7 @@ export function App(props) @{
 		dB.resolve('B1');
 		dA.resolve('A1');
 		const [a, b] = await Promise.all([pA, pB]);
-		expectSeededHydration(
+		await expectSeededHydration(
 			a.html,
 			ClientSiblings,
 			{ a: clientPending(), b: clientPending() },

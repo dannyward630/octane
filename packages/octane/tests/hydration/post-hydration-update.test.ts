@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { compile } from 'octane/compiler';
-import { hydrateRoot, flushSync } from '../../src/index.js';
+import { act, hydrateRoot, flushSync } from '../../src/index.js';
 import * as ServerRT from 'octane/server';
 import { MatchShape, StartShape } from './_fixtures/match-shape.tsrx';
 import type { ResetStore } from './_fixtures/match-shape.tsrx';
@@ -52,7 +52,7 @@ afterEach(() => container.remove());
 describe('hydrateRoot — first update after hydration', () => {
 	for (const withBoundaries of [false, true]) {
 		const label = withBoundaries ? 'real boundaries' : 'SafeFragment passthroughs';
-		it(`does not remount the wrapper chain (${label})`, () => {
+		it(`does not remount the wrapper chain (${label})`, async () => {
 			const store = createResetStore();
 			const log: string[] = [];
 			const props = { store, log, withBoundaries };
@@ -64,7 +64,7 @@ describe('hydrateRoot — first update after hydration', () => {
 			expect(serverButton).toBeTruthy();
 
 			const root = hydrateRoot(container, MatchShape, props);
-			flushSync(() => {});
+			await act(() => {});
 			expect(log).toEqual(['mount:inner']);
 			expect(container.querySelector('.inner-button')).toBe(serverButton);
 
@@ -88,7 +88,7 @@ describe('hydrateRoot — first update after hydration', () => {
 
 	for (const withBoundaries of [false, true]) {
 		const label = withBoundaries ? 'real boundaries' : 'SafeFragment passthroughs';
-		it(`does not remount the chain under a document-shell range owner (${label})`, () => {
+		it(`does not remount the chain under a document-shell range owner (${label})`, async () => {
 			const store = createResetStore();
 			const log: string[] = [];
 			const props = { store, log, withBoundaries };
@@ -108,7 +108,7 @@ describe('hydrateRoot — first update after hydration', () => {
 			expect(serverButton).toBeTruthy();
 
 			const root = hydrateRoot(container, StartShape, props);
-			flushSync(() => {});
+			await act(() => {});
 			expect(log).toEqual(['mount:inner']);
 			expect(container.querySelector('.inner-button')).toBe(serverButton);
 

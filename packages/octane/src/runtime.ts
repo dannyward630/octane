@@ -97,7 +97,7 @@ import {
 } from './event-names.js';
 import { hasOwnProp } from './has-own.js';
 import { postHostTask } from './host-task.js';
-import { hasPendingHostBudget } from './host-budget.js';
+import { hasPendingHostBudget, yieldForHostBudget } from './host-budget.js';
 import { headOwnershipKey } from './head-ownership.js';
 import { resourceHintWarning } from './resource-hint-diagnostics.js';
 import {
@@ -695,6 +695,8 @@ let TRANSITION_TASK_DRIVER: TransitionTaskDriver | null = null;
 let TRANSITION_ROOT_DRIVER: TransitionRootDriver | null = null;
 let VIEW_TRANSITION_DRIVER: ViewTransitionDriver | null = null;
 let SCHEDULED_VISIBILITY_DRIVER: ScheduledVisibilityDriver | null = null;
+// Installed while server-resolved Suspense arms wait for their turn to hydrate.
+let DEFERRED_ARMS: DeferredArms | null = null;
 let DEFERRED_LAYOUT_DRIVER: DeferredLayoutDriver | null = null;
 let STAGED_COMMIT_CAPTURE: StagedCommitCapture | null = null;
 // Function form actions are the only submits the runtime intercepts, and
@@ -11675,6 +11677,7 @@ export function act<T>(fn: () => T | Promise<T>): Promise<T> {
 						hasPendingWork() ||
 						DEFERRED_SWAPS !== null ||
 						transitionTask !== 0 ||
+						DEFERRED_ARMS !== null ||
 						hasPendingHostBudget();
 					drainPassiveEffects();
 					if (!hadWork && !hasPendingWork()) return value;
@@ -11710,6 +11713,8 @@ export function act<T>(fn: () => T | Promise<T>): Promise<T> {
 			if (TRANSITION_TASK_DRIVER) TRANSITION_TASK_DRIVER.adopt(true);
 			if (VIEW_TRANSITION_DRIVER && VIEW_TRANSITION_DRIVER.wouldWrap()) flush();
 			else flushSync(() => {});
+			// Arms waiting for their turn hydrate too, as React's act() flushes OffscreenLane.
+			if (DEFERRED_ARMS) DEFERRED_ARMS.hydrate(null);
 			throwPendingActErrors();
 			drainPassiveEffects();
 			if (!hasPendingWork()) break;
@@ -11733,6 +11738,7 @@ export function act<T>(fn: () => T | Promise<T>): Promise<T> {
 					hasPendingWork() ||
 					DEFERRED_SWAPS !== null ||
 					transitionTask !== 0 ||
+					DEFERRED_ARMS !== null ||
 					hasPendingHostBudget();
 				drainPassiveEffects();
 				if (!hadWork && !hasPendingWork()) return result as T;
@@ -17113,16 +17119,24 @@ function hydrateServerValuesStale(state: HydrateSlot): boolean {
 	const initial = state.initialCaptures;
 	if (initial === null) return false;
 	if (initial.stale || changedHydrateCaptures(initial.props, state.props)) return true;
+	return hydrateContextsChanged(
+		initial.contexts,
+		initial.contextEpoch,
+		CURRENT_SCOPE?.block === state.parentBlock ? CURRENT_SCOPE : state.parentBlock,
+	);
+}
+
+/** Whether a provider above `scope` changed a value since `contexts` were collected. */
+function hydrateContextsChanged(
+	contexts: Map<Context<any>, any> | null,
+	contextEpoch: number,
+	scope: Scope,
+): boolean {
 	// Every provider value change moves the epoch, so an unmoved epoch proves
 	// the inherited context values are the ones the server HTML was claimed with.
 	return (
-		initial.contextEpoch !== contextEpochNow() &&
-		changedHydrateContexts(
-			initial.contexts,
-			collectHydrateContexts(
-				CURRENT_SCOPE?.block === state.parentBlock ? CURRENT_SCOPE : state.parentBlock,
-			),
-		)
+		contextEpoch !== contextEpochNow() &&
+		changedHydrateContexts(contexts, collectHydrateContexts(scope))
 	);
 }
 
@@ -42731,6 +42745,14 @@ export function tryBlock(
 		// New inputs, not the retry its wakeable scheduled, reached a boundary
 		// whose hydration is suspended: as React does, it renders on the client.
 		updated = initial !== undefined && changed;
+		// An arm still waiting for its turn hydrates first, from the inputs its
+		// server HTML was rendered with, and the update then renders over it, as
+		// React's SelectiveHydrationException does. A hydration pass keeps it waiting.
+		if (updated && !hydrating && initial!.deferred) {
+			initialSuspenseHydrationRenderer!(state, initial!);
+			initial = initialSuspenseHydrations?.get(state);
+			updated = initial !== undefined;
+		}
 		if (supersedesInputs) supersedeSignalRetryOwners(state);
 		// A boundary can retry after its parent's render rolls back, e.g. when the
 		// wakeable it was pending on settles. It must render the committed inputs.
@@ -42759,6 +42781,8 @@ export function tryBlock(
 		if (initial !== undefined) (initialSuspenseHydrations ??= new WeakMap()).set(s, initial);
 	}
 	if (initial !== undefined) {
+		// A parent render that brings no new inputs leaves a waiting arm dehydrated.
+		if (initial.deferred && !hydrating) return s.reset;
 		initialSuspenseHydrationRenderer!(s, initial, updated);
 	} else if (s.passthrough) {
 		renderPassthroughTry(s);
@@ -42940,6 +42964,30 @@ interface InitialSuspenseHydration {
 	nativeRaw: string | null;
 	/** The captures changed before a dormant boundary activated; see staleServerValues. */
 	stale?: true;
+	/** True while the arm waits for its turn (DeferredArms), false once it hydrates. */
+	deferred?: boolean;
+	/** The context the arm was deferred under (hydrateContextsChanged). */
+	contexts?: Map<Context<any>, any> | null;
+	contextEpoch?: number;
+	/** The explicit signal owner of the pass that deferred the arm, which its render keeps. */
+	owner?: SignalOwner | null;
+}
+
+/**
+ * Server-resolved Suspense arms that a hydration pass left dehydrated, as React
+ * leaves each server-rendered boundary at OffscreenLane for after the shell
+ * commits. An arm keeps its server DOM, and is queued once the pass that reached
+ * it commits. It hydrates on its turn in a host task, or sooner when a discrete
+ * event targets it or new inputs reach it (tryBlock).
+ */
+interface DeferredArms {
+	/** In the order their passes reached them, so an outer arm precedes its nested arms. */
+	queue: TrySlot[];
+	posted: boolean;
+	/** The root nodes that listen for input to the queued arms (hydrateEventTarget). */
+	hosts: Node[];
+	/** Hydrate the queued arms that contain `target`, or every queued arm. */
+	hydrate: (target: Node | null) => void;
 }
 
 // Server metadata gives each resolved arm an independent adoption scope. The
@@ -43158,6 +43206,33 @@ function renderInitialSuspenseHydration(
 	updated = false,
 ): void {
 	state.pendingThenable = null;
+	const outer = currentHydration;
+	if (outer !== null && initial.deferred !== false && !isHydrateContent(state)) {
+		// A hydration pass leaves the arm for its own turn (DeferredArms). Inputs
+		// that change before then make its server HTML stale.
+		if (updated || outer.staleServerValues) initial.stale = true;
+		if (initial.deferred === undefined) {
+			initial.deferred = true;
+			initial.contextEpoch = contextEpochNow();
+			initial.contexts = collectHydrateContexts(state.parentBlock);
+			initial.owner =
+				activeSynchronousSignalOwner !== null || activeSignalOwnerEnvironment !== undefined
+					? currentExplicitSignalOwner()
+					: null;
+			if (WIP_CAPTURE === null) queueDeferredArm(state);
+			else
+				(WIP_CAPTURE.renderCleanups ??= []).push((discarded) => {
+					if (!discarded) queueDeferredArm(state);
+				});
+		}
+		outer.node = getNextSibling(state.end);
+		return;
+	}
+	if (initial.deferred) {
+		initial.deferred = false;
+		if (hydrateContextsChanged(initial.contexts!, initial.contextEpoch!, state.parentBlock))
+			initial.stale = true;
+	}
 	if (updated) {
 		// New inputs reached the arm while its hydration was suspended. The
 		// server HTML predates them, so, as React client-renders a dehydrated
@@ -43286,8 +43361,8 @@ function renderInitialSuspenseHydration(
 		// The arm's own close matched before this attempt, so the mismatch lies
 		// inside it: as React does for a Suspense boundary, discard its server DOM
 		// and render it on the client rather than fail a root that may have
-		// committed already.
-		if (!clientRenderDehydratedTry(state, previousHydration))
+		// committed already. Stale server HTML reports nothing (staleServerValues).
+		if (!clientRenderDehydratedTry(state, previousHydration) && !hydration.staleServerValues)
 			noteRecoverableHydrationError(() => failure, state.parentBlock);
 		return;
 	}
@@ -43316,6 +43391,139 @@ function renderInitialSuspenseHydration(
 		swapHydration(outerHydration);
 		if (outerHydration !== null) outerHydration.node = getNextSibling(state.end);
 	}
+}
+
+/**
+ * The runtime's own boundary around a `<Hydrate>` island's content, which the
+ * island's activation hydrates as a unit by its own strategy.
+ */
+function isHydrateContent(state: TrySlot): boolean {
+	const slot = state.parentBlock.parentBlock?.slots[0] as HydrateSlot | undefined;
+	return slot?.__kind === 'hydrateBlockSlot' && slot.block === state.parentBlock;
+}
+
+function queueDeferredArm(state: TrySlot): void {
+	const arms: DeferredArms =
+		DEFERRED_ARMS ??
+		(DEFERRED_ARMS = { queue: [], posted: false, hosts: [], hydrate: hydrateDeferredArms });
+	arms.queue.push(state);
+	// The document, a shadow root, or the top of a detached tree.
+	const host = state.start.getRootNode();
+	if (!arms.hosts.includes(host)) {
+		arms.hosts.push(host);
+		listenForArmInput(host, true);
+	}
+	if (arms.posted) return;
+	arms.posted = true;
+	postHostTask(runDeferredArmsTask);
+}
+
+/**
+ * Selective hydration: a discrete event aimed at a queued arm hydrates that
+ * arm, and the arms around it, before the root's own listeners run, as React
+ * hydrates a dehydrated boundary at SyncLane on any event at its root.
+ * Listening above the root covers event types no handler has delegated yet.
+ */
+function hydrateEventTarget(event: Event): void {
+	if (DEFERRED_ARMS && !inFlush && CURRENT_BLOCK === null)
+		DEFERRED_ARMS.hydrate(event.composedPath()[0] as Node);
+}
+
+function listenForArmInput(host: Node, listen: boolean): void {
+	for (const name of HYDRATE_SUPPORTED_INTERACTION_EVENTS) {
+		if ((delegatedEventFlags(name) & EVENT_DISCRETE) === 0) continue;
+		if (listen) host.addEventListener(name, hydrateEventTarget, true);
+		else host.removeEventListener(name, hydrateEventTarget, true);
+	}
+}
+
+/** An arm's turn: at least one arm per task, then more while the shared host budget lasts. */
+function runDeferredArmsTask(): void {
+	if (!DEFERRED_ARMS) return;
+	DEFERRED_ARMS.posted = false;
+	yieldForHostBudget();
+	hydrateDeferredArms(null, true);
+	if (DEFERRED_ARMS && !DEFERRED_ARMS.posted) {
+		DEFERRED_ARMS.posted = true;
+		postHostTask(runDeferredArmsTask);
+	}
+}
+
+function hydrateDeferredArms(target: Node | null, paced = false): void {
+	const arms = DEFERRED_ARMS!;
+	let settled = false;
+	for (let i = 0; i < arms.queue.length;) {
+		const state = arms.queue[i];
+		if (target !== null && !rangeContains(state.start, state.end, target)) {
+			i++;
+			continue;
+		}
+		if (!settled) {
+			// Like any render, an arm's hydration follows the previous commit's
+			// effects. One of them may dispatch input that hydrates arms itself.
+			settled = true;
+			commitEffects();
+			drainPassivesBeforeRender();
+			if (arms.queue[i] !== state) continue;
+		}
+		arms.queue.splice(i, 1);
+		hydrateDeferredArm(state);
+		const spent = paced && yieldForHostBudget() !== undefined;
+		// The arms rendered so far commit together, and their commit queues the
+		// arms nested in them, after them. An event looks for those at once.
+		if (spent || target !== null || i === arms.queue.length) {
+			commitRootRenders();
+			commitEffects();
+		}
+		if (spent) break;
+	}
+	if (arms.queue.length !== 0 || DEFERRED_ARMS !== arms) return;
+	DEFERRED_ARMS = null;
+	for (const host of arms.hosts) listenForArmInput(host, false);
+}
+
+function rangeContains(start: Node, end: Node, target: Node): boolean {
+	// FOLLOWING the start and PRECEDING the end, never DISCONNECTED from them.
+	return (
+		(start.compareDocumentPosition(target) & 5) === 4 &&
+		(end.compareDocumentPosition(target) & 3) === 2
+	);
+}
+
+/** Hydrate one arm directly, in its root's render transaction, without re-rendering its parent. */
+function hydrateDeferredArm(state: TrySlot): void {
+	const initial = initialSuspenseHydrations?.get(state);
+	// An update or an event hydrated it already, or its slot unmounted.
+	if (initial?.deferred !== true || state.parentBlock.disposed) return;
+	const owner = state.parentBlock.idState.renderOwner;
+	const fresh = owner !== undefined && owner.transaction === null;
+	const frame = beginRootRender(owner);
+	// Like the root's own pass, it adopts server DOM, which a rollback keeps.
+	if (fresh) {
+		owner.transaction!.hydrating = true;
+		ROOT_DISCARD_STAMP = -1;
+	}
+	// The arm renders as it would inside its parent's render, so an error it
+	// does not catch propagates and is reported as from there.
+	const previousScope = CURRENT_SCOPE;
+	const previousBlock = CURRENT_BLOCK;
+	CURRENT_SCOPE = CURRENT_BLOCK = state.parentBlock;
+	let failed = false;
+	let failure: unknown;
+	try {
+		const signalOwner = initial.owner;
+		if (signalOwner)
+			runWithSignalOwner(signalOwner, () => renderInitialSuspenseHydration(state, initial));
+		else renderInitialSuspenseHydration(state, initial);
+	} catch (error) {
+		failed = true;
+		failure = error;
+	} finally {
+		CURRENT_SCOPE = previousScope;
+		CURRENT_BLOCK = previousBlock;
+		endRootRender(frame);
+	}
+	if (failed) handleResumeError(state.parentBlock, failure);
 }
 
 /**

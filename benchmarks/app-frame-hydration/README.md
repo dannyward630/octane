@@ -21,21 +21,35 @@ scenario renders the same frame with two section roots, the sidebar and the
 composer, reading a signal themselves. Releasing the adopted server values after
 the hydration commit then re-renders those whole sections in the same task.
 
+The `frame-boundaries` scenario puts the same frame's 11 sections in Suspense
+boundaries: the rail, the sidebar header, shortcuts, its three nav sections and
+footer, the header, composer, suggestions and footer. `hydrateRoot` adopts the
+shell in one task and each boundary hydrates in a later host task, as React's
+do, so the largest boundary, the 48-row Chats section, sets the longest task.
+The `frame` scenario has no boundaries and hydrates in one task, in React too.
+
 ## Operations
 
 - `hydrate_cold`: a fresh browser context per sample, so no JIT state or
   feedback survives. The page loads under a 4× CPU throttle, then the sample
   times `hydrateRoot` plus the work it schedules for the same task.
+- `longest_task_cold` and `busy_cold`: the same samples are traced from
+  `hydrateRoot` until every Suspense boundary's layout effects have run. These
+  are the longest main-thread task in that window and the total of all its
+  tasks. Each row's `meta.tasks` is the median task count.
 - `hydrate_warm`: repeated hydrations of the same server HTML in one
   long-lived page, after four warmups, under the same throttle.
 
 Every sample verifies that hydration adopts every server element, raises no
 recoverable error, delivers a delegated click that re-renders a native-read
-arm, and unmounts cleanly.
+arm, and unmounts cleanly. Once per scenario, a click on a sidebar section
+made right after `hydrateRoot` returns, before any boundary's turn, must still
+collapse that section.
 
 ## Counters
 
-The run also counts deterministic work for one cold hydration of each scenario.
+The run also counts deterministic work for one cold hydration of each
+scenario, through the last boundary.
 It uses a separate jitless Chromium, so inlining cannot hide calls from precise
 coverage, and a young generation large enough that no scavenge runs mid-sample.
 Each row's `meta` records:

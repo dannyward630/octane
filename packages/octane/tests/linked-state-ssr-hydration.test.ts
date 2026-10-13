@@ -355,7 +355,7 @@ describe('useLinkedState hydration', () => {
 		});
 		const resource = deferred<string>();
 		try {
-			flushSync(() => {});
+			await act(() => {});
 			expect(container.querySelector('#hydrated-parked-value')).toBe(sourceNode);
 			expect(captured?.getValue()).toBe('draft:A');
 

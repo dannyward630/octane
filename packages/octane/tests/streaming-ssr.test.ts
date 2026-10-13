@@ -2133,7 +2133,8 @@ describe('streamed page → swap runtime → hydration (end to end)', () => {
 			},
 			{ identifierPrefix: 'page-' },
 		);
-		flushSync(() => {});
+		// The completed boundary hydrates after the shell.
+		await act(() => {});
 		expect(container.querySelector('.id-ok')).toBe(content);
 		expect(seen).toContainEqual(['root', rootId]);
 		expect(seen).toContainEqual(['content', boundaryId]);
@@ -2536,7 +2537,8 @@ describe('streamed page → swap runtime → hydration (end to end)', () => {
 			inner: clientInner,
 			later: clientLater,
 		});
-		flushSync(() => {});
+		// The completed boundaries hydrate after the shell.
+		await act(() => {});
 
 		expect(clientOuter.status).toBe('fulfilled');
 		expect(clientOuter.value).toBe('outer-ready');

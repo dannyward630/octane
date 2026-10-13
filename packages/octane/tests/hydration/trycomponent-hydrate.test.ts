@@ -2,7 +2,7 @@ import { loadCompiledFixtureSource } from '../_server-fixture.js';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { hydrateRoot, flushSync } from '../../src/index.js';
+import { act, hydrateRoot } from '../../src/index.js';
 import * as ServerRT from 'octane/server';
 import { prerender } from 'octane/static';
 import { TryFor, TryComponent, TryComponentFor, MatchShape } from './_fixtures/trycomponent.tsrx';
@@ -60,7 +60,7 @@ describe('hydrateRoot — @try with a component body (router Match shape)', () =
 		expect(lis.map((l) => l.textContent)).toEqual(['Alpha', 'Beta']);
 
 		const root = hydrateRoot(container, TryFor, { promise: Promise.resolve(items) });
-		flushSync(() => {});
+		await act(() => {});
 
 		// Adopted, no rebuild, no @pending; seed script consumed.
 		expect(container.querySelector('#try-for')).toBe(wrapper);
@@ -84,7 +84,7 @@ describe('hydrateRoot — @try with a component body (router Match shape)', () =
 		expect(leaf.textContent).toBe('hello');
 
 		const root = hydrateRoot(container, TryComponent, { promise: Promise.resolve('hello') });
-		flushSync(() => {});
+		await act(() => {});
 
 		// The component subtree was ADOPTED (same node), no rebuild, no @pending.
 		expect(container.querySelector('.leaf')).toBe(leaf);
@@ -110,7 +110,7 @@ describe('hydrateRoot — @try with a component body (router Match shape)', () =
 		expect(rows.map((r) => r.textContent)).toEqual(['Alpha', 'Beta']);
 
 		const root = hydrateRoot(container, TryComponentFor, { promise: Promise.resolve(items) });
-		flushSync(() => {});
+		await act(() => {});
 
 		// Adopted: same <ul>, same <li> instances, no rebuild, no @pending.
 		expect(container.querySelector('ul.list-leaf')).toBe(ul);
@@ -136,7 +136,7 @@ describe('hydrateRoot — @try with a component body (router Match shape)', () =
 		expect(container.querySelector('.fallback')).toBeNull();
 
 		const root = hydrateRoot(container, MatchShape, { promise: Promise.resolve('route') });
-		flushSync(() => {});
+		await act(() => {});
 
 		expect(container.querySelector('.matched')).toBe(matched);
 		expect(container.querySelector('#match')).toBe(wrapper);

@@ -63,7 +63,8 @@ async function hydrateServerHtml(name: PageName, serverProps: Props, clientProps
 			onCaughtError: (error) => caught.push(error),
 		},
 	);
-	flushSync(() => {});
+	// The Suspense arms hydrate after the shell.
+	await act(() => {});
 	// Recoverable and caught errors are published after the hydrating render.
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	return { root, hosts, onAfter, recovered, caught };

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { compile } from 'octane/compiler';
-import { hydrateRoot, flushSync, delegateEvents } from '../../src/index.js';
+import { act, hydrateRoot, flushSync, delegateEvents } from '../../src/index.js';
 import * as ServerRT from 'octane/server';
 import {
 	loadCompiledFixtureSource,
@@ -253,7 +253,8 @@ describe('hoisted document metadata — SSR', () => {
 			{ value: new Promise<string>(() => {}) },
 			{ identifierPrefix: 'stream-root-' },
 		);
-		flushSync(() => {});
+		// The Suspense arm, which owns the title, hydrates after the shell.
+		await act(() => {});
 
 		expect(document.head.querySelector('title')).toBe(title);
 		expect(document.head.querySelectorAll('title')).toHaveLength(1);

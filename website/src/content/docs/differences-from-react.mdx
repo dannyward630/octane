@@ -272,7 +272,10 @@ server.
 
 Octane batches urgent updates in a microtask and renders transition updates in a
 later task, then runs each render to completion. There are urgent and transition
-updates, but no lanes, yield points, CPU time slicing, or selective hydration.
+updates, but no lanes, yield points, or CPU time slicing. Hydration yields at
+Suspense boundaries, as React's does: `hydrateRoot` adopts the shell, and each
+server-rendered boundary hydrates in a later task, or first when the user
+interacts with it.
 
 The useful transition behavior remains. `isPending` commits first, with the previous
 state, so the browser can paint it before the transition renders, and it falls in

@@ -81,7 +81,7 @@ describe.each([false, true])('hydrateRoot — resolved @try siblings (dev=%s)', 
 
 	it.each([false, true])(
 		'adopts following components and binds their events after a resolved boundary (client failure=%s)',
-		(fail) => {
+		async (fail) => {
 			container.innerHTML = ServerRT.renderToString(server.App, { fail: false }).html;
 			const original = [...container.querySelectorAll('button')];
 			const choose = vi.fn();
@@ -91,7 +91,7 @@ describe.each([false, true])('hydrateRoot — resolved @try siblings (dev=%s)', 
 			let root: ReturnType<typeof hydrateRoot> | undefined;
 			try {
 				root = hydrateRoot(container, client.App, { fail, choose }, { onCaughtError: caught });
-				flushSync(() => {});
+				await act(() => {});
 				const buttons = [...container.querySelectorAll('button')];
 				expect(buttons.map((node) => node.textContent)).toEqual([
 					'before',

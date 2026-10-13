@@ -1574,25 +1574,29 @@ ${source}`;
 				expect(outputs.map((node) => node.textContent)).toEqual(Array(rows).fill('server result'));
 				const errors: unknown[] = [];
 				hydration = bootstrapStreamedSignalHydration(streamedSignals);
-				root = client.hydrateRoot(
-					container,
-					clientModule.App,
-					{
-						gate: Promise.resolve('gate'),
-						load: browserLoad,
-						remember: (owner: SignalOwner | null) => clientOwners.add(ownerKey(owner)),
-					},
-					{
-						signalOwner: hydration.signalOwner,
-						onRecoverableError: (error) => errors.push(error),
-						onUncaughtError: (error) => errors.push(error),
-					},
-				);
+				// A synchronous act() also hydrates the Suspense arms after the shell.
+				const hydrated = client.act(() => {
+					root = client.hydrateRoot(
+						container,
+						clientModule.App,
+						{
+							gate: Promise.resolve('gate'),
+							load: browserLoad,
+							remember: (owner: SignalOwner | null) => clientOwners.add(ownerKey(owner)),
+						},
+						{
+							signalOwner: hydration!.signalOwner,
+							onRecoverableError: (error) => errors.push(error),
+							onUncaughtError: (error) => errors.push(error),
+						},
+					);
+				});
 				// Every owner a server pass evaluated a query under is one the browser
 				// resumes, and every row has its own. Check before draining: a query
 				// without its server seed refetches from here on.
 				expect(clientOwners.size).toBe(rows);
 				expect(serverOwners).toEqual(clientOwners);
+				await hydrated;
 				await drainProducers();
 				client.flushSync(() => {});
 				expect(browserLoad).not.toHaveBeenCalled();
