@@ -22,6 +22,7 @@ import {
 	getNativeAdoptionResolver,
 	isNativeAdoptionMiss,
 	isNativeWriteGuarded,
+	nativeReadSerializer,
 	reportNativeRead,
 	setNativeAdoptionResolver,
 	setNativeReadObserver,
@@ -54,10 +55,6 @@ export interface GraphOwner {
 	/** Holds a writable or asynchronous derived cell that new render inputs cannot re-select. */
 	unkeyedState?: boolean;
 	beginAdoption(seed: ScopeSeed): AdoptionFrame;
-	serializeRead(
-		node: ScopedNode,
-		read: SignalReadMode,
-	): readonly NativeSerializedScope[] | undefined;
 	trace(type: SignalTraceEvent['type'], node?: ScopedNode): void;
 }
 
@@ -969,7 +966,7 @@ class GraphReadSource implements NativeReadSource {
 				? canonical.serialize?.(this.view!.canonicalRevision)
 				: undefined;
 		const node = this.node;
-		return node.revision === revision ? node.owner.serializeRead(node, this.read) : undefined;
+		return node.revision === revision ? nativeReadSerializer!(node, this.read) : undefined;
 	}
 
 	retired(): boolean {
