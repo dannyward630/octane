@@ -68,7 +68,9 @@ Use `query$` from `octane/signals` for data that the page needs. Read it with
 `.get()` inside `@try`/`@pending`/`@catch`. While a query is waiting, the server
 sends the pending content. When its first value arrives, the server sends the
 ready HTML for that boundary. Separate boundaries let a fast section appear
-without waiting for a slower one.
+without waiting for a slower one. If a query fails on the server, the boundary
+keeps its pending content and the browser renders it, showing `@catch` if the
+browser's attempt fails too (see [Render errors](#render-errors)).
 
 ```tsrx
 import 'octane/signals';
@@ -272,6 +274,29 @@ renders its `@pending` fallback; synchronously-resolved `use()` still seeds. Use
 `hydrateRoot` renders a boundary the server left pending on the client, keeping
 the server DOM around it, and reports it once through `onRecoverableError`.
 
+#### Render errors
+
+As in React, the server never runs an error boundary: a `@catch` arm or an
+`<ErrorBoundary>` fallback renders only in the browser. Every server renderer
+handles a render error, or a rejected `use()`, the same way:
+
+- Inside a Suspense boundary (a `@try` with `@pending`, or `<Suspense>`), the
+  error reaches `onError`, and the nearest such boundary ships its fallback,
+  marked for the client to render. A boundary that already streamed its
+  fallback is marked by a later instruction instead. No part of the error,
+  and no seed for the failed content, reaches the page.
+- Outside every Suspense boundary, it fails the render: `renderToString`
+  throws, `prerender` rejects, and a stream fails its shell (`onShellError`, or
+  a rejected `renderToReadableStream`). A `@try` with only `@catch` does not
+  stop it.
+
+`hydrateRoot` renders a marked boundary afresh from client data, running its
+`use()` calls and requests again, and reports it once through
+`onRecoverableError`, as React reports a boundary its server could not finish.
+If that client render throws, the boundary's own `@catch` arm or the nearest
+client error boundary takes the error, as in any client render; a catch arm
+that takes it in that first render is reported alone, through `onCaughtError`.
+
 ### `renderToStaticMarkup(component, props?, options?) => RenderResult` — `octane/server`
 
 Like `renderToString` but produces clean, **non-hydratable** HTML: no
@@ -281,8 +306,9 @@ script. For static pages / email.
 ### `prerender(component, props?, options?) => Promise<RenderResult>` — `octane/static`
 
 Awaits **all** data: every `use(thenable)` resolves and Suspense boundaries
-render their success arm (or route rejection to `@catch`). Use for SSG or any
-place that wants fully-resolved HTML with no client fallback.
+render their success arm. A rejection is a render error (see
+[Render errors](#render-errors)). Use for SSG or any place that wants
+fully-resolved HTML with no client fallback.
 
 ### `renderToPipeableStream(component, props?, options?)` — `octane/server`
 
@@ -297,8 +323,7 @@ streaming only; the buffered renderers stay doctype-free, also matching
 React). Scoped styles flush with the shell
 (before the body markup) and per-wave with their segment; hoisted head elements
 render with the shell only. `hydrateRoot` on the client adopts the swapped-in
-DOM byte-for-byte, including per-boundary `use()` value or rejection seeds (a
-rejected boundary hydrates directly into its server-rendered `@catch` arm). Node
+DOM byte-for-byte, including per-boundary `use()` value seeds. Node
 destinations honor `write(false)`/`drain`; destination errors or an early close
 cancel the render.
 
@@ -326,7 +351,7 @@ carries the shell's metadata only; head elements hoisted inside a boundary that
 streams later are still re-created client-side, while late-discovered Float
 sheet resources ride the stream itself (see "Not built yet"). A recoverable error in
 Suspense content reaches `onError`, preserves the emitted fallback, and marks
-only that boundary for client rendering. Calling `abort(reason)` reports the
+only that boundary for client rendering ([Render errors](#render-errors)). Calling `abort(reason)` reports the
 reason for each abandoned pending task, preserves emitted fallbacks for client
 recovery, closes the destination, and invokes `onAllReady` once as the terminal
 readiness notification; an unpublished shell still fails only once through
@@ -534,17 +559,14 @@ policy applies to Vite, Rsbuild, and generated Node or Web Worker servers.
   between canonical full passes (a deep waterfall costs ~2 full passes + cheap
   subtree re-runs, not D+1 full passes). The emitted HTML always comes from a
   full pass, so hydration byte-format is identical either way. Resolved values
-  and versioned rejection metadata are serialized into the seed script so
-  hydration does not re-fetch, re-suspend, or replace a server `@catch` arm.
-  Compiler-owned request factories consult their matching server-provided seed
-  before running, while existing promises, contexts, and externally owned
-  hydration promises retain their original ownership.
-  Rejection records preserve primitive and JSON-safe plain-object reasons plus
-  Error names, messages, and enumerable custom fields. Cyclic fields are
-  bounded and marked, while hostile or opaque values degrade to fixed safe
-  markers instead of breaking the response. Rejection metadata lives outside
-  fulfilled values, and the undefined wire encoding escapes its string prefix,
-  so sentinel-shaped user data remains ordinary data.
+  are serialized into the seed script so hydration does not re-fetch or
+  re-suspend. A rejection is a render error, so its boundary ships no seeds
+  and renders on the client. Compiler-owned request factories consult their
+  matching server-provided seed before running, while existing promises,
+  contexts, and externally owned hydration promises retain their original
+  ownership. Request-site metadata lives outside fulfilled values, and the
+  undefined wire encoding escapes its string prefix, so sentinel-shaped user
+  data remains ordinary data.
 - `useId` counters are root-local. Server output is hydration-stable when the
   client passes the same `identifierPrefix`; distinct sibling roots should use
   distinct prefixes.
@@ -716,8 +738,10 @@ export default defineConfig({
 
 The catch component receives `{ error, reset }`; the pending component receives
 no props. When both are configured, the catch boundary is closest to the route
-and the pending boundary wraps it, so route errors reach the catch UI while
-suspensions still select the pending UI. Paths must be Vite-root paths. `index.html` must contain exactly one
+and the pending boundary wraps it. Suspensions select the pending UI. A route
+error on the server ships the pending UI for the browser to render the route,
+where a repeated error reaches the catch UI ([Render errors](#render-errors));
+without a pending component, it fails the response. Paths must be Vite-root paths. `index.html` must contain exactly one
 `<!--ssr-head-->` marker, one `<!--ssr-body-->` marker, and one closing `</body>`
 tag; builds now fail with an actionable error when that hydration contract is
 malformed.
@@ -776,9 +800,10 @@ These are the known gaps between Octane SSR and a full streaming SSR stack:
   independent-island captures cross through their defined protocols. Arbitrary
   route/request state is not automatically serialized.
 - **Error digests**: `onError` and the shell callbacks exist, but there are no
-  React-style error digests. Recoverable Suspense errors retain their fallback
-  and mark that boundary for client rendering; a fatal post-shell error ends the
-  stream with every still-pending boundary marked for client rendering.
+  React-style error digests; the page carries no error detail at all.
+  Recoverable Suspense errors retain their fallback and mark that boundary for
+  client rendering; a fatal post-shell error ends the stream with every
+  still-pending boundary marked for client rendering.
 - **Document orchestration beyond the streaming doctype**: a streamed `<html>`
   root gets the core-owned doctype described above, but core does not own
   arbitrary preamble insertion, bootstrap script/module lists, import-map

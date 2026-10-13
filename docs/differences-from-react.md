@@ -1999,10 +1999,11 @@ normalizer accepts, in addition to ordinary objects.
 Server `useSyncExternalStore` falls back to `getSnapshot` when
 `getServerSnapshot` is absent. Transition starters and optimistic setters from
 server hooks are no-ops; a server hook's transition starter does not invoke its
-callback. Portals emit an empty placeholder. Unlike React's client-only error
-boundaries, template `@catch` also catches during SSR. JSX Suspense errors render
-its fallback and notify `onError`; a pending promise with no boundary makes a
-synchronous buffered render throw instead of returning partial HTML.
+callback. Portals emit an empty placeholder. As in React, error boundaries are
+client-only: a server render error renders the nearest Suspense boundary's
+fallback for a client render and notifies `onError`; a pending promise with no
+boundary makes a synchronous buffered render throw instead of returning partial
+HTML.
 
 ### Streaming
 
@@ -2120,9 +2121,13 @@ hydration walk, two static branches that share a root tag are not told apart:
 <span class="expanded">...</span>
 ```
 
-A `@try` body whose server render threw adopts the server's `@catch` arm
-rather than rendering the boundary on the client (template `@catch` also
-catches during SSR).
+Server render errors follow React. The server never runs an error boundary: an
+error, or a rejected `use()`, reaches `onError` and leaves the nearest Suspense
+boundary's fallback, which hydration renders afresh from client data and
+reports through `onRecoverableError`. There a `@catch` arm takes a repeated
+throw. With no Suspense boundary above it, the error fails the server render,
+even under a catch-only `@try` or `ErrorBoundary`. See
+[Render errors](./ssr.md#render-errors).
 
 A `<Hydrate>` boundary replays captured interaction events as constructed,
 untrusted copies that keep the captured event's `timeStamp`, including through

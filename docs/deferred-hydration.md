@@ -441,11 +441,12 @@ authored style long enough to preserve the hash of the sibling scope it sits in
 collects the style scopes owned by removed descendant components and emits them
 with the rendered static content.
 
-For streamed static content, a synchronous unhandled server error still reaches
-the nearest authored server catch (or the stream's fatal path). If a pending
-fallback has already flushed, a later rejection or abort terminalizes that
-server-owned range and retains the fallback; it cannot request client recovery
-because its client graph does not exist.
+For streamed static content, a synchronous server error passes out of the
+static range to the nearest Suspense boundary around it, or fails the shell
+(see [Render errors](./ssr.md#render-errors)). If a pending fallback has already
+flushed, a later rejection or abort terminalizes that server-owned range and
+retains the fallback; it cannot request client recovery because its client
+graph does not exist, and a `@catch` arm inside the range never renders.
 
 ## Behavior-only roots and external ownership
 
