@@ -9,6 +9,7 @@ import {
 	derivedState,
 	endSignalBatch,
 	historicalBindingRead,
+	initializeValue,
 	inspectNativeNode,
 	isThenable,
 	readNode,
@@ -264,10 +265,7 @@ export class ScopeImpl implements Scope, GraphOwner {
 	signal$<T>(key: string, initial: T): WritableSignal<T> {
 		const node = createScopeNode<T>(this, key, 'signal');
 		const seed = initialScopeSeed(this, key) ?? retainedScopeSeed(this, key);
-		node.state = readyState(seed ? (seed.value as T) : initial);
-		node.lastState = node.state;
-		node.last = (node.state.snapshot as { value: T }).value;
-		node.hasLast = true;
+		initializeValue(node, seed ? (seed.value as T) : initial);
 		consumeScopeSeed(this, key);
 		return node as WritableSignal<T>;
 	}
@@ -900,10 +898,7 @@ export function createDeclaredSignalCell<T>(
 	const [node, created] = declaredScopeNode<T>(owner, key, 'signal');
 	if (!created) return node as WritableSignal<T>;
 	const seed = initialScopeSeed(owner, key) ?? retainedScopeSeed(owner, key);
-	node.state = readyState(seed && !preferInitial ? (seed.value as T) : initial);
-	node.lastState = node.state;
-	node.last = (node.state.snapshot as { value: T }).value;
-	node.hasLast = true;
+	initializeValue(node, seed && !preferInitial ? (seed.value as T) : initial);
 	consumeScopeSeed(owner, key);
 	return node as WritableSignal<T>;
 }
