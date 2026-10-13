@@ -119,6 +119,12 @@ const EXPECTED_SNAPSHOTS = Object.freeze({
 		unusedStyle: false,
 		cleaned: true,
 	},
+	'descriptor-children': {
+		before: 'ab',
+		after: 'bc',
+		survivor: true,
+		cleaned: true,
+	},
 	'binding-vanilla': {
 		before: 0,
 		after: 1,

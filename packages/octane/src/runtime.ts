@@ -751,6 +751,13 @@ let publishManualFormPending: typeof publishRegisteredManualFormPending = noop;
 let preparePortalEventOwners: typeof prepareRegisteredPortalEventOwners = noop;
 let teardownPortalState: typeof teardownRegisteredPortalState = noop;
 let releasePortalTarget: typeof releaseRegisteredPortalTarget = noop;
+// childSlot's optional value regimes. A portal, signal handle or Context
+// reaches a renderable hole only from its creator: createPortal installs the
+// portal regime, signal bindings the handle subscription, and context creation
+// the Context read, so bundles without them keep only these truthiness tests.
+let PORTAL_CHILD: typeof renderPortalChild | null = null;
+let SIGNAL_CHILD: typeof bindImplicitSignalChild | null = null;
+let CONTEXT_CHILD: typeof useContextInternal | null = null;
 let NATIVE_BLOCK_RETRIES: WeakMap<Block, NativeReadRetry> | null = null;
 // Hydration-only state: client paths read it behind `hydrationStarted`.
 let NATIVE_ADOPTION_RELEASES: NativeAdoptionState[] | null = null;
@@ -1213,6 +1220,7 @@ function trackSignalRetryListKeys<T>(
 export function enableSignalBindings(abi = 1, potentialOnly = false): void {
 	if (abi !== 1) throw new TypeError(formatClientError(74));
 	SIGNAL_BINDINGS_ENABLED = true;
+	SIGNAL_CHILD = bindImplicitSignalChild;
 	if (!potentialOnly) enableSignalDocument(abi);
 }
 
@@ -16454,6 +16462,7 @@ export function __createCompiledContext<T>(defaultValue: T): Context<T> {
 }
 
 function initializeContext<T>(ctx: Context<T>, defaultValue: T): Context<T> {
+	CONTEXT_CHILD = useContextInternal;
 	ctx.$$kind = CONTEXT_TAG;
 	ctx.defaultValue = defaultValue;
 	ctx.$$version = 0;
@@ -34240,6 +34249,7 @@ export function createPortal(
 	target: Element | DocumentFragment,
 	props: any = undefined,
 ): PortalDescriptor {
+	PORTAL_CHILD = renderPortalChild;
 	const key = portalKey(props);
 	return { $$kind: PORTAL_TAG, body, target, key, props: key === null ? props : undefined };
 }
@@ -39380,6 +39390,99 @@ export function bindSignalChild(
 	return binding;
 }
 
+// A signal passed through an otherwise-unmarked prop is syntactically
+// indistinguishable from another renderable child. Keep ordinary primitives
+// untouched and activate the signal owner only after the nominal runtime
+// capability is observed. Returns whether it rendered the slot.
+function bindImplicitSignalChild(
+	parentScope: Scope,
+	slotKey: number,
+	domParent: Node,
+	value: unknown,
+	anchor: Node | null | undefined,
+	ownEnd: boolean | undefined,
+	ownsHost: Element | undefined,
+	compactable: boolean | undefined,
+	bindingMarker: string | undefined,
+): boolean {
+	if (IMPLICIT_SIGNAL_CHILD_DEPTH !== 0) return false;
+	const previous = (parentScope.slots[slotKey] as ChildSlot | undefined)?.implicitSignal;
+	const handle = isSignalHandle(value);
+	if (!handle && previous === undefined) return false;
+	if (handle) enableSignalBindings();
+	IMPLICIT_SIGNAL_CHILD_DEPTH++;
+	let token: unknown;
+	try {
+		token = runWithBlockSignalOwner(parentScope, () =>
+			bindSignalChild(
+				parentScope,
+				previous,
+				slotKey,
+				domParent,
+				value,
+				`runtime:${slotKey}`,
+				anchor,
+				ownEnd,
+				ownsHost,
+				compactable,
+				undefined,
+				bindingMarker,
+			),
+		);
+	} finally {
+		IMPLICIT_SIGNAL_CHILD_DEPTH--;
+	}
+	const state = parentScope.slots[slotKey] as ChildSlot | undefined;
+	if (state !== undefined) state.implicitSignal = token;
+	return true;
+}
+
+// childSlot's portal regime: render the descriptor's body into its foreign
+// target, leaving the slot's own markers empty. Switching in from any other
+// content tears that down first, and any other value tears a portal down.
+// Returns whether `value` is a portal.
+function renderPortalChild(
+	state: ChildSlot,
+	value: unknown,
+	parentBlock: Block,
+	domParent: Node,
+	hydration: HydrationCapability | null,
+): boolean {
+	if (value == null || (value as any).$$kind !== PORTAL_TAG) {
+		if (state.portal != null) {
+			teardownPortalState(state.portal);
+			state.portal = null;
+		}
+		return false;
+	}
+	const portalDesc = value as PortalDescriptor;
+	if (state.forSlot !== null) {
+		if (ROOT_RENDER_TRANSACTION !== null && hydration === null) clearChildContent(state);
+		else teardownChildForSlot(state);
+	}
+	if (state.block !== null || state.text !== null || state.hostNode !== null) {
+		clearChildContent(state);
+	}
+	state.portal = renderPortalState(
+		state.portal,
+		parentBlock,
+		portalDesc.target,
+		portalDesc.body,
+		portalDesc.props,
+		// The DOM element containing this hole is the portal's logical parent.
+		domParent,
+		undefined,
+		portalDesc.key,
+	);
+	// Conditional portals and portals inside directive helpers use childSlot
+	// rather than the compiler's direct portal helper. Their retained end anchor
+	// still locates the authored position inside any enclosing Fragment refs.
+	if (activeFragments.size !== 0 && state.end !== null) {
+		registerValuePortalFragmentOwners(state.portal, parentBlock, state.end);
+	}
+	return true;
+}
+
 /** @internal Address an ordinary renderable slot without narrowing its value semantics. */
 export function bindingChildSlot(
 	parentScope: Scope,
@@ -39470,41 +39573,21 @@ export function childSlot(
 			}
 		}
 	}
-	if (IMPLICIT_SIGNAL_CHILD_DEPTH === 0) {
-		const existing = parentScope.slots[slotKey] as ChildSlot | undefined;
-		const previous = existing?.implicitSignal;
-		if (isSignalHandle(value) || previous !== undefined) {
-			// An arbitrary prop/alias is syntactically indistinguishable from another
-			// renderable child. Keep ordinary primitives untouched and activate the
-			// signal owner only after the nominal runtime capability is observed.
-			if (isSignalHandle(value)) enableSignalBindings();
-			IMPLICIT_SIGNAL_CHILD_DEPTH++;
-			let token: unknown;
-			try {
-				token = runWithBlockSignalOwner(parentScope, () =>
-					bindSignalChild(
-						parentScope,
-						previous,
-						slotKey,
-						domParent,
-						value,
-						`runtime:${slotKey}`,
-						anchor,
-						ownEnd,
-						ownsHost,
-						compactable,
-						undefined,
-						bindingMarker,
-					),
-				);
-			} finally {
-				IMPLICIT_SIGNAL_CHILD_DEPTH--;
-			}
-			const state = parentScope.slots[slotKey] as ChildSlot | undefined;
-			if (state !== undefined) state.implicitSignal = token;
-			return;
-		}
-	}
+	if (
+		SIGNAL_CHILD &&
+		SIGNAL_CHILD(
+			parentScope,
+			slotKey,
+			domParent,
+			value,
+			anchor,
+			ownEnd,
+			ownsHost,
+			compactable,
+			bindingMarker,
+		)
+	)
+		return;
 	// Reading the host's tag costs two DOM accessors and this runs for every
 	// renderable hole on every render, so lead with the cheap facts. A de-opt list
 	// ITEM (`includeKeyedSingle === false`, passed only by deoptItemBody) shares
@@ -39555,8 +39638,8 @@ export function childSlot(
 	// such as Promise<Context<T>> while preserving the normal Suspense route for
 	// a pending thenable and the normal context dependency tracking for Context.
 	while (value !== null && (typeof value === 'object' || typeof value === 'function')) {
-		if ((value as any).$$kind === CONTEXT_TAG) {
-			value = useContextInternal(value as Context<unknown>);
+		if (CONTEXT_CHILD && (value as any).$$kind === CONTEXT_TAG) {
+			value = CONTEXT_CHILD(value as Context<unknown>);
 			continue;
 		}
 		if (typeof (value as any).then === 'function') {
@@ -39885,44 +39968,7 @@ export function childSlot(
 		state.end = end;
 	}
 
-	// Portal descriptor → render its body into a foreign target; the slot's own
-	// markers stay empty (content lives in `target`). Switching in from any other
-	// content tears that down first; a non-portal value below tears the portal down.
-	const portalDesc =
-		value != null && (value as any).$$kind === PORTAL_TAG
-			? (value as unknown as PortalDescriptor)
-			: null;
-	if (portalDesc === null && state.portal != null) {
-		teardownPortalState(state.portal);
-		state.portal = null;
-	}
-	if (portalDesc !== null) {
-		if (state.forSlot !== null) {
-			if (ROOT_RENDER_TRANSACTION !== null && hydration === null) clearChildContent(state);
-			else teardownChildForSlot(state);
-		}
-		if (state.block !== null || state.text !== null || state.hostNode !== null) {
-			clearChildContent(state);
-		}
-		state.portal = renderPortalState(
-			state.portal,
-			parentBlock,
-			portalDesc.target,
-			portalDesc.body,
-			portalDesc.props,
-			// The DOM element containing this hole is the portal's logical parent.
-			domParent,
-			undefined,
-			portalDesc.key,
-		);
-		// Conditional portals and portals inside directive helpers use childSlot
-		// rather than the compiler's direct portal helper. Their retained end anchor
-		// still locates the authored position inside any enclosing Fragment refs.
-		if (activeFragments.size !== 0 && state.end !== null) {
-			registerValuePortalFragmentOwners(state.portal, parentBlock, state.end);
-		}
-		return;
-	}
+	if (PORTAL_CHILD && PORTAL_CHILD(state, value, parentBlock, domParent, hydration)) return;
 
 	// Arrays, iterables, Fragment descriptors, and a lone explicitly-keyed
 	// element share one keyed-list regime. Keeping a keyed single child in this
