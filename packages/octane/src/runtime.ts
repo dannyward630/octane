@@ -39149,7 +39149,10 @@ function bindImplicitSignalChild(
 	const previous = (parentScope.slots[slotKey] as ChildSlot | undefined)?.implicitSignal;
 	const handle = isSignalHandle(value);
 	if (!handle && previous === undefined) return false;
-	if (handle) enableSignalBindings();
+	// Enable the document directly. Calling enableSignalBindings here would make
+	// it and this function reference each other, and the minifier cannot drop
+	// that cycle from a signal-free bundle.
+	if (handle && !signalDocumentEnabled) enableSignalDocument(1);
 	IMPLICIT_SIGNAL_CHILD_DEPTH++;
 	let token: unknown;
 	try {
@@ -39318,10 +39321,26 @@ export function childSlot(
 	// neither, so the bundler folds this branch away there. The engine check
 	// covers a handle that a lazily imported module passes through an opaque
 	// child before any compiled signal module has installed the capability.
-	const signalChild = SIGNAL_CHILD || (NATIVE_SIGNAL_HYDRATION ? bindImplicitSignalChild : null);
-	if (
-		signalChild &&
-		signalChild(
+	// Both are direct truthiness tests: the minifier folds a never-written
+	// driver only there, never through a local copy.
+	if (SIGNAL_CHILD) {
+		if (
+			SIGNAL_CHILD(
+				parentScope,
+				slotKey,
+				domParent,
+				value,
+				anchor,
+				ownEnd,
+				ownsHost,
+				compactable,
+				bindingMarker,
+			)
+		)
+			return;
+	} else if (
+		NATIVE_SIGNAL_HYDRATION &&
+		bindImplicitSignalChild(
 			parentScope,
 			slotKey,
 			domParent,
