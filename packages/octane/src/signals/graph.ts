@@ -769,6 +769,17 @@ export class ScopedNode<T = any> implements SignalHandle<T>, ReactiveNode {
 		this.retryRequest(options);
 	}
 
+	/** This node's native read channel for `read`, created on first use. */
+	nativeReadSource(read: SignalReadMode): NativeReadSource {
+		const field =
+			read === 'value'
+				? 'nativeSource'
+				: read === 'latest'
+					? 'nativeLatestSource'
+					: 'nativeSnapshotSource';
+		return (this[field] ??= createNativeSource(this, read));
+	}
+
 	constructor(
 		readonly owner: GraphOwner,
 		readonly key: string,
@@ -907,26 +918,69 @@ export function inspectNativeNode(node: ScopedNode, read: SignalReadMode): Nativ
 }
 
 function createNativeSource(node: ScopedNode, read: SignalReadMode): NativeReadSource {
-	const view = declarationViews?.get(node);
-	return view === undefined ? createGraphSource(node, read) : createViewSource(node, view, read);
+	return new GraphReadSource(node, read, declarationViews?.get(node));
 }
 
-function createGraphSource(node: ScopedNode, read: SignalReadMode): NativeReadSource {
-	return {
-		getVersion: () => (activeCandidate && !activeCandidate.observes(node) ? NaN : node.revision),
-		subscribe: (notify) => {
-			assertAlive(node.owner);
-			return attachObserver(node, notify, true);
-		},
-		serialize: (revision) =>
-			node.revision === revision ? node.owner.serializeRead(node, read) : undefined,
-		retired: () => node.owner.retired,
-		inspect:
-			typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__
-				? () => inspectNativeNode(node, read)
-				: undefined,
-	};
+/**
+ * A node's native read channel for one read mode (ScopedNode.nativeReadSource).
+ * A declaration view's channel forwards to its canonical cell's once promoted,
+ * so witnesses taken during the render stay valid. The view and its canonical
+ * cell share one owner.
+ */
+class GraphReadSource implements NativeReadSource {
+	/** DevTools metadata, installed on the prototype only in profiling builds. */
+	declare inspect?: () => NativeReadInspection;
+
+	constructor(
+		readonly node: ScopedNode,
+		readonly read: SignalReadMode,
+		readonly view: DeclarationView | undefined,
+	) {}
+
+	/** The promoted view's canonical channel, or undefined while this one is live. */
+	canonicalSource(): NativeReadSource | undefined {
+		const view = this.view;
+		return view?.promoted ? view.canonical.nativeReadSource(this.read) : undefined;
+	}
+
+	getVersion(): number {
+		const view = this.view;
+		if (view !== undefined) {
+			const canonical = this.canonicalSource();
+			if (canonical)
+				return canonical.getVersion() === view.canonicalRevision ? view.viewRevision : NaN;
+			if (view.retired) return NaN;
+		}
+		const node = this.node;
+		return activeCandidate && !activeCandidate.observes(node) ? NaN : node.revision;
+	}
+
+	subscribe(notify: () => void): () => void {
+		const canonical = this.canonicalSource();
+		if (canonical) return canonical.subscribe(notify);
+		assertAlive(this.node.owner);
+		return attachObserver(this.node, notify, true);
+	}
+
+	serialize(revision: number): readonly NativeSerializedScope[] | undefined {
+		const canonical = this.canonicalSource();
+		if (canonical)
+			return revision === this.view!.viewRevision
+				? canonical.serialize?.(this.view!.canonicalRevision)
+				: undefined;
+		const node = this.node;
+		return node.revision === revision ? node.owner.serializeRead(node, this.read) : undefined;
+	}
+
+	retired(): boolean {
+		return this.node.owner.retired;
+	}
 }
+
+if (typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__)
+	GraphReadSource.prototype.inspect = function (this: GraphReadSource) {
+		return this.canonicalSource()?.inspect!() ?? inspectNativeNode(this.node, this.read);
+	};
 
 export function readNode<T>(node: ScopedNode<T>, read: SignalReadMode = 'value'): NodeState<T> {
 	assertAlive(node.owner);
@@ -966,13 +1020,7 @@ function trackRead(
 ): void {
 	if (activeNode) linkDependency(node, activeNode, trackingCycle);
 	if (getNativeReadObserver()) {
-		const field =
-			read === 'value'
-				? 'nativeSource'
-				: read === 'latest'
-					? 'nativeLatestSource'
-					: 'nativeSnapshotSource';
-		const source = (node[field] ??= createNativeSource(node, read));
+		const source = node.nativeReadSource(read);
 		reportNativeRead(
 			candidate ? candidate.nativeSource(node, read, source) : source,
 			node.revision,
@@ -1092,7 +1140,7 @@ export function unchangedLiveRead(
 	)
 		return undefined;
 	return {
-		live: (node[nativeSourceField(read)] ??= createNativeSource(node, read)),
+		live: node.nativeReadSource(read),
 		version: node.revision,
 	};
 }
@@ -1484,47 +1532,6 @@ export type DeclarationViewFork = (
 
 let declarationViews: WeakMap<ScopedNode, DeclarationView> | undefined;
 
-function nativeSourceField(read: SignalReadMode) {
-	return read === 'value'
-		? ('nativeSource' as const)
-		: read === 'latest'
-			? ('nativeLatestSource' as const)
-			: ('nativeSnapshotSource' as const);
-}
-
-function createViewSource(
-	view: ScopedNode,
-	record: DeclarationView,
-	read: SignalReadMode,
-): NativeReadSource {
-	const own = createGraphSource(view, read);
-	const canonical = (): NativeReadSource =>
-		(record.canonical[nativeSourceField(read)] ??= createNativeSource(record.canonical, read));
-	return {
-		getVersion: () =>
-			record.promoted
-				? canonical().getVersion() === record.canonicalRevision
-					? record.viewRevision
-					: NaN
-				: record.retired
-					? NaN
-					: own.getVersion(),
-		subscribe: (notify) => (record.promoted ? canonical() : own).subscribe(notify),
-		serialize: (version) =>
-			record.promoted
-				? version === record.viewRevision
-					? canonical().serialize?.(record.canonicalRevision)
-					: undefined
-				: own.serialize?.(version),
-		// The view and its canonical cell share one owner.
-		retired: own.retired,
-		inspect:
-			typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__
-				? () => (record.promoted ? canonical() : own).inspect!()
-				: undefined,
-	};
-}
-
 export function createDeclarationView<T>(
 	canonical: ScopedNode<T>,
 	fork: (target: ScopedNode<T>, frame: SignalCandidateFrame) => CandidateProducer | undefined,
@@ -1803,7 +1810,6 @@ registerCandidateGraph({
 	releaseRetainedOwners,
 	retainOwners,
 	releaseRetention,
-	createNativeSource,
 	attachObserver,
 	declarationViewFork,
 });

@@ -1,6 +1,5 @@
 import { formatClientError } from '../error-codes.client.generated.js';
 import type { NativeReadSource } from './read-protocol.js';
-import { candidateGraph as bridge } from './transition-state.js';
 import {
 	registerNativeSignalActionExtension,
 	type SignalActionFrame,
@@ -98,17 +97,7 @@ export function installNativeSignalActionExtension(): void {
 				if (!entry.sources) continue;
 				for (const read of ['value', 'latest', 'snapshot'] as const) {
 					const source = entry.sources[read];
-					if (!source) continue;
-					const field =
-						read === 'value'
-							? 'nativeSource'
-							: read === 'latest'
-								? 'nativeLatestSource'
-								: 'nativeSnapshotSource';
-					source.accept(
-						(entry.node[field] ??= bridge.createNativeSource(entry.node, read)),
-						revision,
-					);
+					if (source) source.accept(entry.node.nativeReadSource(read), revision);
 				}
 			}
 		},
