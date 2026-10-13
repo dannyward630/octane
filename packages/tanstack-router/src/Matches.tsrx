@@ -58,12 +58,16 @@ function MatchesInner() @{
 		if (acknowledgement[0] === matches) settleOwner(acknowledgement, true);
 	}, [acknowledgement, matches]);
 	// The router's mount work waits for this first commit (useTransitioner).
+	// Defer the call: selective hydration flushes this effect in the capture
+	// phase of the discrete event that revealed the arm, before the event
+	// reaches its handler. A synchronous commitLocation here would race with
+	// the click's own navigation. A microtask runs after event dispatch ends.
 	useLayoutEffect(() => {
 		const routerState = router as any;
 		routerState._matchesCommitted = true;
 		const mount = routerState._mountAfterMatches;
 		routerState._mountAfterMatches = undefined;
-		mount?.();
+		if (mount) queueMicrotask(mount);
 	}, [router]);
 
 	<MatchContext value={routeId}>
