@@ -1,6 +1,7 @@
 import { formatClientError } from '../error-codes.client.generated.js';
 import { associateSignalOwnerDocument } from './early-values.js';
 import {
+	enterDeferredSignalOwner,
 	enterSynchronousSignalOwner,
 	installDefaultSignalOwner,
 	restoreSynchronousSignalOwner,
@@ -18,7 +19,11 @@ export let streamedSignalOwnerActivator: ((owner: SignalOwner) => void) | undefi
  * that never enable signals do not retain it.
  */
 export let signalOwnerFrame:
-	| { enter: typeof enterSynchronousSignalOwner; restore: typeof restoreSynchronousSignalOwner }
+	| {
+			enter: typeof enterSynchronousSignalOwner;
+			defer: typeof enterDeferredSignalOwner;
+			restore: typeof restoreSynchronousSignalOwner;
+	  }
 	| undefined;
 
 /** @internal Shared document identity for state-only and component consumers. */
@@ -41,7 +46,11 @@ export function enableSignalDocument(abi = 1): void {
 	signalDocumentEnabled = true;
 	if (defaultInstalled) return;
 	defaultInstalled = true;
-	signalOwnerFrame = { enter: enterSynchronousSignalOwner, restore: restoreSynchronousSignalOwner };
+	signalOwnerFrame = {
+		enter: enterSynchronousSignalOwner,
+		defer: enterDeferredSignalOwner,
+		restore: restoreSynchronousSignalOwner,
+	};
 	installDefaultSignalOwner(() =>
 		typeof document === 'undefined' ? null : documentSignalOwner(document),
 	);
