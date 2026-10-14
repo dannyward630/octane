@@ -124,6 +124,169 @@ describe('compileToVolarMappings', () => {
 		expect(result.errors).toEqual([]);
 	});
 
+	it('type-checks dynamic tags against the selected component props', () => {
+		const source = `export function Label(props: { label: string }) @{ <span>{props.label}</span> }
+export function View(props: { component: typeof Label; label: string }) @{
+	<{props.component} label={props.label} />
+}
+`;
+		const result = compileToVolarMappings(source, 'dynamic-tag.tsrx');
+		const invalid = compileToVolarMappings(
+			source.replace('label={props.label}', 'href={props.label}'),
+			'invalid-dynamic-tag.tsrx',
+		);
+		expect(result.errors).toEqual([]);
+		expect(invalid.errors).toEqual([]);
+
+		const root = mkdtempSync(join(tmpdir(), 'octane-volar-dynamic-tag-'));
+		try {
+			mkdirSync(join(root, 'node_modules'));
+			symlinkSync(
+				fileURLToPath(new URL('../..', import.meta.url)),
+				join(root, 'node_modules/octane'),
+				'dir',
+			);
+			const validFile = join(root, 'DynamicTag.tsx');
+			const invalidFile = join(root, 'InvalidDynamicTag.tsx');
+			writeFileSync(validFile, result.code);
+			writeFileSync(invalidFile, invalid.code);
+			const program = ts.createProgram({
+				rootNames: [validFile, invalidFile],
+				options: {
+					jsx: ts.JsxEmit.Preserve,
+					module: ts.ModuleKind.ESNext,
+					moduleResolution: ts.ModuleResolutionKind.Bundler,
+					noEmit: true,
+					skipLibCheck: false,
+					strict: true,
+					target: ts.ScriptTarget.ESNext,
+					types: [],
+				},
+			});
+			const diagnosticsFor = (file: string) => {
+				const sourceFile = program.getSourceFile(file)!;
+				return [
+					...program.getSyntacticDiagnostics(sourceFile),
+					...program.getSemanticDiagnostics(sourceFile),
+				];
+			};
+			expect(diagnosticsFor(validFile).map(({ code }) => code)).toEqual([]);
+			expect(diagnosticsFor(invalidFile).map(({ code }) => code)).toEqual([2322]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it('type-checks dynamic string tags against the active JSX intrinsic map', () => {
+		const domSource = `export function Box(props: { tag: 'div' | 'span' }) @{
+	<{props.tag} id={123} notAnAttribute="x" />
+}
+`;
+		// TypeScript reports the first invalid JSX attribute for this element;
+		// keep the unknown-prop check separate from the invalid `id` value.
+		const domUnknownSource = `export function Box(props: { tag: 'div' | 'span' }) @{
+	<{props.tag} notAnAttribute="x" />
+}
+`;
+		const validRendererSource = `/** @jsxImportSource @fixture/dynamic-intrinsics */
+export function Scene(props: { tag: 'panel' | 'tile'; label: string }) @{
+	<{props.tag} label={props.label} />
+}
+`;
+		const invalidRendererSource = validRendererSource.replace(
+			'label={props.label}',
+			'notAnAttribute="x"',
+		);
+		const cases = [
+			['DomDynamicTag', compileToVolarMappings(domSource, 'dom-dynamic-tag.tsrx')],
+			[
+				'DomUnknownDynamicTag',
+				compileToVolarMappings(domUnknownSource, 'dom-unknown-dynamic-tag.tsrx'),
+			],
+			[
+				'ValidRendererDynamicTag',
+				compileToVolarMappings(validRendererSource, 'renderer-dynamic-tag.tsrx'),
+			],
+			[
+				'InvalidRendererDynamicTag',
+				compileToVolarMappings(invalidRendererSource, 'invalid-renderer-dynamic-tag.tsrx'),
+			],
+		] as const;
+		for (const [, compiled] of cases) expect(compiled.errors).toEqual([]);
+
+		const root = mkdtempSync(join(tmpdir(), 'octane-volar-dynamic-intrinsics-'));
+		try {
+			mkdirSync(join(root, 'node_modules'));
+			symlinkSync(
+				fileURLToPath(new URL('../..', import.meta.url)),
+				join(root, 'node_modules/octane'),
+				'dir',
+			);
+			mkdirSync(join(root, 'node_modules/@fixture/dynamic-intrinsics'), { recursive: true });
+			writeFileSync(
+				join(root, 'node_modules/@fixture/dynamic-intrinsics/package.json'),
+				JSON.stringify({
+					name: '@fixture/dynamic-intrinsics',
+					exports: { './jsx-runtime': './jsx-runtime.d.ts' },
+				}),
+			);
+			writeFileSync(
+				join(root, 'node_modules/@fixture/dynamic-intrinsics/jsx-runtime.d.ts'),
+				`export namespace JSX {
+	interface IntrinsicElements {
+		panel: { label: string };
+		tile: { label: string };
+	}
+}
+`,
+			);
+			const files = cases.map(([name, compiled]) => {
+				const file = join(root, `${name}.tsx`);
+				writeFileSync(file, compiled.code);
+				return file;
+			});
+			const program = ts.createProgram({
+				rootNames: files,
+				options: {
+					jsx: ts.JsxEmit.ReactJSX,
+					module: ts.ModuleKind.ESNext,
+					moduleResolution: ts.ModuleResolutionKind.Bundler,
+					noEmit: true,
+					skipLibCheck: true,
+					strict: true,
+					target: ts.ScriptTarget.ESNext,
+					types: [],
+				},
+			});
+			const diagnosticsFor = (file: string) =>
+				program.getSemanticDiagnostics(program.getSourceFile(file)!);
+			const domDiagnostics = diagnosticsFor(files[0]);
+			const domUnknownDiagnostics = diagnosticsFor(files[1]);
+			const validRendererDiagnostics = diagnosticsFor(files[2]);
+			const invalidDomMessages = domDiagnostics.map((diagnostic) =>
+				ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'),
+			);
+			const invalidDomUnknownMessages = domUnknownDiagnostics.map((diagnostic) =>
+				ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'),
+			);
+			const invalidRendererDiagnostics = diagnosticsFor(files[3]);
+
+			expect(validRendererDiagnostics).toEqual([]);
+			expect(domDiagnostics.map(({ code }) => code)).toEqual([2322]);
+			expect(invalidDomMessages.join('\n')).toContain(
+				"Type 'number' is not assignable to type 'string",
+			);
+			expect(domUnknownDiagnostics.map(({ code }) => code)).toEqual([2322]);
+			expect(invalidDomUnknownMessages.join('\n')).toContain('notAnAttribute');
+			expect(invalidRendererDiagnostics.map(({ code }) => code)).toEqual([2322]);
+			expect(
+				ts.flattenDiagnosticMessageText(invalidRendererDiagnostics[0]!.messageText, '\n'),
+			).toContain('notAnAttribute');
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it.each([false, true])(
 		'type-checks authored Suspense alongside pending directives (signal module: %s)',
 		(signalModule) => {

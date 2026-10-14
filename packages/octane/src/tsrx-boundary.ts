@@ -34,3 +34,33 @@ export const TsrxErrorBoundary = typeOnlyBoundary as unknown as (
 		fallback?: (error: unknown, reset: () => void) => unknown;
 	},
 ) => never;
+
+type DynamicComponent = (props: never) => unknown;
+type DynamicTarget = string | DynamicComponent;
+
+type UnionToIntersection<Union> = (Union extends unknown ? (value: Union) => void : never) extends (
+	value: infer Intersection,
+) => void
+	? Intersection
+	: never;
+
+type DynamicTargetProps<Target, IntrinsicElements extends object> = [Target] extends [
+	keyof IntrinsicElements,
+]
+	? UnionToIntersection<IntrinsicElements[Target & keyof IntrinsicElements]>
+	: [Target] extends [(props: infer Props) => unknown]
+		? Props
+		: never;
+
+/** Type-only stand-in for dynamic tags. The compiler supplies the active
+ * renderer's JSX intrinsic map so string-tag unions receive the same checks as
+ * authored intrinsic tags, while component targets use their own props. */
+export const Dynamic = typeOnlyBoundary as unknown as <
+	IntrinsicElements extends object = Record<string, unknown>,
+	Target extends DynamicTarget = DynamicTarget,
+>(
+	props: {
+		is: Target;
+		__tsrxIntrinsicElements?: IntrinsicElements;
+	} & DynamicTargetProps<Target, IntrinsicElements>,
+) => never;

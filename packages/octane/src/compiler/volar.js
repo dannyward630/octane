@@ -97,7 +97,7 @@ const OCTANE_PLATFORM = {
 	imports: {
 		fragment: 'octane',
 		suspense: 'octane/tsrx-boundary',
-		dynamic: 'octane',
+		dynamic: 'octane/tsrx-boundary',
 		errorBoundary: 'octane/tsrx-boundary',
 		forOfIterableHelper: 'octane/tsrx-iterable',
 		// Host-element spreads in the virtual TSX lower to
@@ -118,6 +118,34 @@ const OCTANE_PLATFORM = {
 		importSpecifier: 'server',
 	},
 	hooks: {
+		transformElementAttributes: (attrs, ctx, element) => {
+			const dynamicName = element.openingElement?.name;
+			const isDynamicTag =
+				element.metadata?.dynamicElement === true ||
+				(dynamicName?.type === 'JSXExpressionContainer' && dynamicName.isDynamic === true);
+			if (!ctx.typeOnly || !isDynamicTag) return attrs;
+			const intrinsics = ctx.comments
+				?.map((comment) => jsxImportSourcePragmaModule(comment.value))
+				.find((module) => module !== null);
+			if (intrinsics == null) return attrs;
+			return [
+				...attrs,
+				b.jsx_attribute(
+					b.jsx_id('__tsrxIntrinsicElements'),
+					b.jsx_expression_container(
+						b.ts_as(b.ts_as(b.id('undefined'), b.ts_keyword_type('unknown')), {
+							type: 'TSImportType',
+							argument: b.literal(`${intrinsics}/jsx-runtime`),
+							options: null,
+							qualifier: b.ts_qualified_name(b.id('JSX'), b.id('IntrinsicElements')),
+							typeArguments: null,
+							metadata: { path: [] },
+						}),
+					),
+					false,
+				),
+			];
+		},
 		canHoistStaticNode: (node) => !containsComponentJsx(node),
 	},
 };
