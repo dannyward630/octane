@@ -50,6 +50,7 @@ import {
 	retryTransitionHolder,
 	wakeHeldTransitions,
 	COMMIT_OP,
+	journalRootProperty,
 	journalUndo,
 	retireDetachedBindingLeases,
 	unmountPresentationRefs,
@@ -130,6 +131,7 @@ import {
 	maybeFlushDiscrete,
 	UNCONTROLLED,
 	type ControlledState,
+	type DevFormCheck,
 	controlledDelivery,
 	beginControlledDelivery,
 	DEV_FORM_CHECK_MARK,
@@ -440,6 +442,8 @@ export function withSlot<T>(sym: HookSlot, fn: (...a: any[]) => T, ...args: any[
 	}
 }
 
+export let EFFECT_EVENT_INVOCATION_DEPTH = 0;
+
 /**
  * React 19 `useEffectEvent` — returns a fresh wrapper each render whose shared
  * cell invokes the latest COMMITTED `fn`. Effect Events are non-reactive (the
@@ -479,7 +483,12 @@ export function useEffectEvent<F extends (...args: any[]) => any>(fn: F, slot?: 
 		if (CURRENT_SCOPE !== null && EFFECT_EVENT_LIFECYCLE_DEPTH === 0) {
 			throw new Error(formatClientError(11));
 		}
-		return cell.impl.apply(undefined, args);
+		EFFECT_EVENT_INVOCATION_DEPTH++;
+		try {
+			return cell.impl.apply(undefined, args);
+		} finally {
+			EFFECT_EVENT_INVOCATION_DEPTH--;
+		}
 	}) as F;
 }
 
@@ -524,14 +533,44 @@ export function queueControlledCommit<T>(queue: T[], item: T): void {
 		});
 }
 
-export function queueDevFormCheck(queue: Element[], el: Element): void {
+let devFormLifetimes: WeakMap<Scope, { active: boolean }> | undefined;
+
+function devFormLifetime(owner: Scope): { active: boolean } {
+	const lifetimes = (devFormLifetimes ??= new WeakMap());
+	let lifetime = lifetimes.get(owner);
+	if (lifetime === undefined || !lifetime.active) {
+		lifetime = { active: !owner.block.disposed };
+		lifetimes.set(owner, lifetime);
+		if (lifetime.active) {
+			const current = lifetime;
+			if (ROOT_RENDER_TRANSACTION !== null && owner.cleanups === null)
+				journalRootProperty(owner, 'cleanups', null);
+			const cleanups = (owner.cleanups ??= []);
+			const retire = () => {
+				current.active = false;
+			};
+			cleanups.push(retire);
+			// A rollback can restore the cleanup list without running this callback.
+			if (ROOT_RENDER_TRANSACTION !== null)
+				journalUndo(() => {
+					retire();
+					const index = cleanups.lastIndexOf(retire);
+					if (index !== -1) cleanups.splice(index, 1);
+				});
+		}
+	}
+	return lifetime;
+}
+
+export function queueDevFormCheck(queue: DevFormCheck[], el: Element, owner: Scope | null): void {
 	if (drainControlledSyncs === noop) drainControlledSyncs = drainQueuedControlledSyncs;
-	queue.push(el);
+	const check = { element: el, lifetime: owner === null ? null : devFormLifetime(owner) };
+	queue.push(check);
 	if (ROOT_RENDER_TRANSACTION !== null) {
 		const host = el as any;
 		const generation = DEV_FORM_CHECK_GENERATION;
 		journalUndo(() => {
-			const index = queue.lastIndexOf(el);
+			const index = queue.lastIndexOf(check);
 			if (index !== -1) queue.splice(index, 1);
 			// The element can be retried in this same diagnostic generation. Roll back
 			// the stamp alongside the queue entry so that retry is not deduplicated.
