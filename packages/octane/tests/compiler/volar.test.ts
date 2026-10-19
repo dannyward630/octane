@@ -680,6 +680,24 @@ process.stdout.write(JSON.stringify({
 		source: { src: string };
 		mesh: { domOnly?: boolean };`,
 			);
+			const hostModuleRoot = join(root, 'node_modules/@fixture/host');
+			mkdirSync(hostModuleRoot, { recursive: true });
+			writeFileSync(
+				join(hostModuleRoot, 'package.json'),
+				JSON.stringify({
+					name: '@fixture/host',
+					exports: { './jsx-runtime': './jsx-runtime.d.ts' },
+				}),
+			);
+			writeFileSync(
+				join(hostModuleRoot, 'jsx-runtime.d.ts'),
+				`export namespace JSX {
+	interface IntrinsicElements {
+		hostOnly: { host: number };
+	}
+}
+`,
+			);
 			const augmentationFile = join(root, 'object-augmentation.d.ts');
 			writeFileSync(
 				augmentationFile,
@@ -716,6 +734,14 @@ declare module '@fixture/object-intrinsics/jsx-runtime' {
 				'/src/ObjectDynamicInspection.object.tsrx',
 				{ renderers: OBJECT_RENDERERS },
 			);
+			const authoredObjectDynamicSource =
+				'/** @jsxImportSource @fixture/object-intrinsics */\n' +
+				"export function AuthoredObjectDynamic(props: { tag: 'mesh' }) @{ <><mesh objectOnly /><{props.tag} objectOnly /></> }\n";
+			const authoredObjectDynamic = compileToVolarMappings(
+				authoredObjectDynamicSource,
+				'/src/AuthoredObjectDynamic.object.tsrx',
+				{ renderers: OBJECT_RENDERERS },
+			);
 			const invalidObjectDynamic = compileToVolarMappings(
 				"export function InvalidObjectDynamic(props: { tag: 'mesh' }) @{ <{props.tag} domOnly /> }\n",
 				'/src/InvalidObjectDynamic.object.tsrx',
@@ -730,12 +756,14 @@ declare module '@fixture/object-intrinsics/jsx-runtime' {
 			const objectFile = join(root, 'ObjectScene.tsx');
 			const objectDynamicFile = join(root, 'ObjectDynamic.tsx');
 			const objectDynamicInspectionFile = join(root, 'ObjectDynamicInspection.tsx');
+			const authoredObjectDynamicFile = join(root, 'AuthoredObjectDynamic.tsx');
 			const invalidObjectDynamicFile = join(root, 'InvalidObjectDynamic.tsx');
 			const invalidDomFile = join(root, 'InvalidDomScene.tsx');
 			writeFileSync(domFile, dom.code);
 			writeFileSync(objectFile, object.code);
 			writeFileSync(objectDynamicFile, objectDynamic.code);
 			writeFileSync(objectDynamicInspectionFile, objectDynamicInspection.code);
+			writeFileSync(authoredObjectDynamicFile, authoredObjectDynamic.code);
 			writeFileSync(invalidObjectDynamicFile, invalidObjectDynamic.code);
 			writeFileSync(invalidDomFile, invalidDom.code);
 
@@ -771,6 +799,28 @@ declare module '@fixture/object-intrinsics/jsx-runtime' {
 			expect(
 				ts.flattenDiagnosticMessageText(diagnosticFor(invalidObjectDynamicFile)!.messageText, '\n'),
 			).toMatch(/Property 'domOnly' does not exist on type/);
+
+			// The generated imports and alias for the dynamic tag must not prevent
+			// TypeScript from honoring the authored renderer pragma. The host
+			// tsconfig deliberately selects a different JSX namespace; this file's
+			// static `<mesh>` and dynamic tag must both use object-renderer props.
+			expect(authoredObjectDynamic.code.indexOf('@jsxImportSource')).toBeLessThan(
+				authoredObjectDynamic.code.indexOf('import { Dynamic as TsrxDynamic }'),
+			);
+			const authoredPragmaProgram = ts.createProgram({
+				rootNames: [authoredObjectDynamicFile],
+				options: {
+					jsx: ts.JsxEmit.ReactJSX,
+					jsxImportSource: '@fixture/host',
+					module: ts.ModuleKind.ESNext,
+					moduleResolution: ts.ModuleResolutionKind.Bundler,
+					noEmit: true,
+					skipLibCheck: true,
+					strict: true,
+					target: ts.ScriptTarget.ESNext,
+				},
+			});
+			expect(ts.getPreEmitDiagnostics(authoredPragmaProgram)).toHaveLength(0);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
