@@ -56,9 +56,9 @@ import {
  * Platform descriptor for `createJsxTransform`. Mirrors `tsrx-react`'s React
  * descriptor with the small set of differences for octane:
  *
- *   - `imports.errorBoundary` / `imports.dynamic` point at octane
- *     itself (we don't ship separate sub-packages for these — the runtime
- *     exports them directly).
+ *   - `imports.dynamic` / `imports.errorBoundary` point at
+ *     `octane/tsrx-boundary`, whose type-only components preserve dynamic-tag
+ *     props and provide the `@catch` boundary surface.
  *   - `jsx.classAttrName: 'class'` because octane keeps authored
  *     `class` instead of rewriting to React's `className`.
  *   - `jsx.multiRefStrategy: 'array'` — the octane runtime accepts a
@@ -97,7 +97,7 @@ const OCTANE_PLATFORM = {
 	imports: {
 		fragment: 'octane',
 		suspense: 'octane/tsrx-boundary',
-		dynamic: 'octane',
+		dynamic: 'octane/tsrx-boundary',
 		errorBoundary: 'octane/tsrx-boundary',
 		forOfIterableHelper: 'octane/tsrx-iterable',
 		// Host-element spreads in the virtual TSX lower to

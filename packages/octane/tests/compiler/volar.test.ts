@@ -104,6 +104,71 @@ describe('compileToVolarMappings', () => {
 		}
 	});
 
+	it('type-checks dynamic tags against the element or component named by the tag', () => {
+		const root = mkdtempSync(join(tmpdir(), 'octane-volar-dynamic-'));
+		try {
+			mkdirSync(join(root, 'node_modules'));
+			symlinkSync(
+				fileURLToPath(new URL('../..', import.meta.url)),
+				join(root, 'node_modules/octane'),
+				'dir',
+			);
+			const sources = [
+				`export function Host(props: { tag: 'div' | 'span' }) @{ <{props.tag} id="ok" /> }`,
+				`export function InvalidHostType(props: { tag: 'div' | 'span' }) @{ <{props.tag} id={123} /> }`,
+				`export function InvalidHostAttribute(props: { tag: 'div' | 'span' }) @{ <{props.tag} id="ok" notAnAttribute="x" /> }`,
+				`export function BroadHost(props: { tag: string }) @{ <{props.tag} id="ok" /> }`,
+				`export function InvalidBroadHostType(props: { tag: string }) @{ <{props.tag} id={123} /> }`,
+				`export function InvalidBroadHostAttribute(props: { tag: string }) @{ <{props.tag} id="ok" notAnAttribute="x" /> }`,
+				`declare function Component(props: { label: string; count: number }): unknown;
+export function ValidComponent() @{ const tag = Component; <{tag} label="ok" count={1} /> }`,
+				`declare function Component(props: { label: string; count: number }): unknown;
+export function InvalidComponentType() @{ const tag = Component; <{tag} label={123} count={1} /> }`,
+				`declare function Component(props: { label: string; count: number }): unknown;
+export function InvalidComponentProp() @{ const tag = Component; <{tag} label="ok" count={1} notAProp="x" /> }`,
+			];
+			const files = sources.map((source, index) => {
+				const file = join(root, `Dynamic${index}.tsx`);
+				const result = compileToVolarMappings(source, `Dynamic${index}.tsrx`);
+				expect(result.errors).toEqual([]);
+				writeFileSync(file, result.code);
+				return file;
+			});
+			const program = ts.createProgram(files, {
+				jsx: ts.JsxEmit.Preserve,
+				module: ts.ModuleKind.ESNext,
+				moduleResolution: ts.ModuleResolutionKind.Bundler,
+				noEmit: true,
+				strict: true,
+				skipLibCheck: true,
+				target: ts.ScriptTarget.ESNext,
+				types: [],
+			});
+			const errors = files.map((file) =>
+				program
+					.getSemanticDiagnostics(program.getSourceFile(file)!)
+					.map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')),
+			);
+			expect(errors[0]).toEqual([]);
+			expect(errors[1]).toEqual([
+				expect.stringContaining("Type 'number' is not assignable to type 'string'"),
+			]);
+			expect(errors[2]).toEqual([expect.stringContaining('notAnAttribute')]);
+			expect(errors[3]).toEqual([]);
+			expect(errors[4]).toEqual([
+				expect.stringContaining("Type 'number' is not assignable to type 'string'"),
+			]);
+			expect(errors[5]).toEqual([expect.stringContaining('notAnAttribute')]);
+			expect(errors[6]).toEqual([]);
+			expect(errors[7]).toEqual([
+				expect.stringContaining("Type 'number' is not assignable to type 'string'"),
+			]);
+			expect(errors[8]).toEqual([expect.stringContaining('notAProp')]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it('retains computed method keys when generated brackets have no source mapping', () => {
 		const source = `const key = Symbol.iterator;
 		export const iterable = { [key]() { return [1, 2][Symbol.iterator](); } };`;
