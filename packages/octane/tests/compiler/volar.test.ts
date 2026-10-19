@@ -31,11 +31,21 @@ function writeOctaneJsxRuntimeStub(root: string, intrinsics: string): void {
 	mkdirSync(octaneRoot, { recursive: true });
 	writeFileSync(
 		join(octaneRoot, 'package.json'),
-		JSON.stringify({ name: 'octane', exports: { './jsx-runtime': './jsx-runtime.d.ts' } }),
+		JSON.stringify({
+			name: 'octane',
+			exports: {
+				'./jsx-runtime': './jsx-runtime.d.ts',
+				'./tsrx-boundary': './tsrx-boundary.ts',
+			},
+		}),
 	);
 	writeFileSync(
 		join(octaneRoot, 'jsx-runtime.d.ts'),
-		`export namespace JSX {\n\tinterface IntrinsicElements {\n${intrinsics}\n\t}\n}\n`,
+		`export namespace JSX {\n\tinterface IntrinsicElements {\n${intrinsics}\n\t}\n}\nexport namespace Octane {\n\texport namespace JSX {\n\t\tinterface IntrinsicElements {\n${intrinsics}\n\t\t}\n\t}\n}\n`,
+	);
+	writeFileSync(
+		join(octaneRoot, 'tsrx-boundary.ts'),
+		readFileSync(fileURLToPath(new URL('../../src/tsrx-boundary.ts', import.meta.url)), 'utf8'),
 	);
 }
 
@@ -126,6 +136,9 @@ export function ValidComponent() @{ const tag = Component; <{tag} label="ok" cou
 export function InvalidComponentType() @{ const tag = Component; <{tag} label={123} count={1} /> }`,
 				`declare function Component(props: { label: string; count: number }): unknown;
 export function InvalidComponentProp() @{ const tag = Component; <{tag} label="ok" count={1} notAProp="x" /> }`,
+				`import type { SignalHandle } from 'octane/signals';
+declare const id$: SignalHandle<string | undefined>;
+export function SignalHost(props: { tag: 'div' | 'span' }) @{ <{props.tag} id={id$} /> }`,
 			];
 			const files = sources.map((source, index) => {
 				const file = join(root, `Dynamic${index}.tsx`);
@@ -151,19 +164,20 @@ export function InvalidComponentProp() @{ const tag = Component; <{tag} label="o
 			);
 			expect(errors[0]).toEqual([]);
 			expect(errors[1]).toEqual([
-				expect.stringContaining("Type 'number' is not assignable to type 'string'"),
+				expect.stringContaining("Type 'number' is not assignable to type"),
 			]);
 			expect(errors[2]).toEqual([expect.stringContaining('notAnAttribute')]);
 			expect(errors[3]).toEqual([]);
 			expect(errors[4]).toEqual([
-				expect.stringContaining("Type 'number' is not assignable to type 'string'"),
+				expect.stringContaining("Type 'number' is not assignable to type"),
 			]);
 			expect(errors[5]).toEqual([expect.stringContaining('notAnAttribute')]);
 			expect(errors[6]).toEqual([]);
 			expect(errors[7]).toEqual([
-				expect.stringContaining("Type 'number' is not assignable to type 'string'"),
+				expect.stringContaining("Type 'number' is not assignable to type"),
 			]);
 			expect(errors[8]).toEqual([expect.stringContaining('notAProp')]);
+			expect(errors[9]).toEqual([]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -690,6 +704,23 @@ declare module '@fixture/object-intrinsics/jsx-runtime' {
 				'/src/ObjectScene.object.tsrx',
 				{ renderers: OBJECT_RENDERERS },
 			);
+			const objectDynamicSource =
+				"export function ObjectDynamic(props: { tag: 'mesh' }) @{ <{props.tag} objectOnly /> }\n";
+			const objectDynamic = compileToVolarMappings(
+				objectDynamicSource,
+				'/src/ObjectDynamic.object.tsrx',
+				{ renderers: OBJECT_RENDERERS },
+			);
+			const objectDynamicInspection = compileTypesInspection(
+				objectDynamicSource,
+				'/src/ObjectDynamicInspection.object.tsrx',
+				{ renderers: OBJECT_RENDERERS },
+			);
+			const invalidObjectDynamic = compileToVolarMappings(
+				"export function InvalidObjectDynamic(props: { tag: 'mesh' }) @{ <{props.tag} domOnly /> }\n",
+				'/src/InvalidObjectDynamic.object.tsrx',
+				{ renderers: OBJECT_RENDERERS },
+			);
 			const invalidDom = compileToVolarMappings(
 				'export function InvalidDomScene() @{ <customThing custom="dom" /> }\n',
 				'/src/InvalidDomScene.tsrx',
@@ -697,13 +728,27 @@ declare module '@fixture/object-intrinsics/jsx-runtime' {
 			);
 			const domFile = join(root, 'DomScene.tsx');
 			const objectFile = join(root, 'ObjectScene.tsx');
+			const objectDynamicFile = join(root, 'ObjectDynamic.tsx');
+			const objectDynamicInspectionFile = join(root, 'ObjectDynamicInspection.tsx');
+			const invalidObjectDynamicFile = join(root, 'InvalidObjectDynamic.tsx');
 			const invalidDomFile = join(root, 'InvalidDomScene.tsx');
 			writeFileSync(domFile, dom.code);
 			writeFileSync(objectFile, object.code);
+			writeFileSync(objectDynamicFile, objectDynamic.code);
+			writeFileSync(objectDynamicInspectionFile, objectDynamicInspection.code);
+			writeFileSync(invalidObjectDynamicFile, invalidObjectDynamic.code);
 			writeFileSync(invalidDomFile, invalidDom.code);
 
 			const program = ts.createProgram({
-				rootNames: [augmentationFile, domFile, objectFile, invalidDomFile],
+				rootNames: [
+					augmentationFile,
+					domFile,
+					objectFile,
+					objectDynamicFile,
+					objectDynamicInspectionFile,
+					invalidObjectDynamicFile,
+					invalidDomFile,
+				],
 				options: {
 					jsx: ts.JsxEmit.Preserve,
 					module: ts.ModuleKind.ESNext,
@@ -715,11 +760,17 @@ declare module '@fixture/object-intrinsics/jsx-runtime' {
 				},
 			});
 			const diagnostics = ts.getPreEmitDiagnostics(program);
-			expect(diagnostics).toHaveLength(1);
-			expect(diagnostics[0].file?.fileName).toBe(invalidDomFile);
-			expect(ts.flattenDiagnosticMessageText(diagnostics[0].messageText, '\n')).toMatch(
-				/customThing.*JSX\.IntrinsicElements/,
-			);
+			expect(diagnostics).toHaveLength(2);
+			const diagnosticFor = (file: string) =>
+				diagnostics.find((diagnostic) => diagnostic.file?.fileName === file);
+			expect(diagnosticFor(invalidDomFile)).toBeDefined();
+			expect(
+				ts.flattenDiagnosticMessageText(diagnosticFor(invalidDomFile)!.messageText, '\n'),
+			).toMatch(/customThing.*JSX\.IntrinsicElements/);
+			expect(diagnosticFor(invalidObjectDynamicFile)).toBeDefined();
+			expect(
+				ts.flattenDiagnosticMessageText(diagnosticFor(invalidObjectDynamicFile)!.messageText, '\n'),
+			).toMatch(/Property 'domOnly' does not exist on type/);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

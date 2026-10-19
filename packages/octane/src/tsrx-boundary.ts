@@ -38,17 +38,20 @@ export const TsrxErrorBoundary = typeOnlyBoundary as unknown as (
 
 type DynamicTag = string | ((props: any) => unknown);
 
-type DynamicTagProps<T extends DynamicTag> = T extends keyof Octane.JSX.IntrinsicElements
-	? Octane.JSX.IntrinsicElements[T]
+type DynamicTagProps<
+	T extends DynamicTag,
+	IntrinsicElements extends object,
+> = T extends keyof IntrinsicElements
+	? IntrinsicElements[T]
 	: T extends string
-		? Octane.JSX.IntrinsicElements[keyof Octane.JSX.IntrinsicElements]
+		? IntrinsicElements[keyof IntrinsicElements]
 		: T extends (props: infer Props) => unknown
 			? Props
 			: never;
 
 /** Preserve the selected host element's or component's props in Volar's TSX view. */
-export const Dynamic = typeOnlyBoundary as unknown as <T extends DynamicTag>(
-	props: {
-		is: T;
-	} & DynamicTagProps<T>,
+export type DynamicFor<IntrinsicElements extends object> = <T extends DynamicTag>(
+	props: { is: T } & DynamicTagProps<T, IntrinsicElements>,
 ) => never;
+
+export const Dynamic = typeOnlyBoundary as unknown as DynamicFor<Octane.JSX.IntrinsicElements>;
