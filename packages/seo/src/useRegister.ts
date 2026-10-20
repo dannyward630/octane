@@ -1,19 +1,17 @@
 /**
  * Register one component instance's descriptors with the enclosing registry.
  *
- * Registration happens DURING RENDER, not in an effect: effects never run on the
- * server, so an effect-based registration would leave the server-rendered
- * `<head>` empty and hand crawlers nothing. That is precisely the failure this
- * package exists to remove.
+ * Render-time registration keeps SSR and hydration snapshots complete. Client
+ * effects confirm each source after commit; the outlet reverts sources from a
+ * caught render that never committed.
  *
- * The effect below exists only for the client half of the lifecycle: it notifies
- * the outlet after a commit that changed something, and removes the source on
- * unmount so a navigated-away page stops contributing. Document metadata does
- * not affect layout, so it does not need to block paint.
+ * The second effect removes the source on unmount. Document metadata does not
+ * affect layout, so it does not need to block paint.
  */
 import { useContext, useEffect, useRef } from 'octane';
 import { SeoContext } from './context.js';
 import type { SeoConfig, SeoDescriptor } from './descriptors.js';
+import { commitSeoSource } from './registry.js';
 
 export function useRegisterSeo(descriptors: readonly SeoDescriptor[], config?: SeoConfig): void {
 	const registry = useContext(SeoContext);
@@ -38,6 +36,7 @@ export function useRegisterSeo(descriptors: readonly SeoDescriptor[], config?: S
 	useEffect(() => {
 		registry.register(idRef.current, descriptors);
 		if (config !== undefined) registry.configure(idRef.current, config);
+		commitSeoSource(registry, idRef.current);
 		registry.flush();
 	});
 

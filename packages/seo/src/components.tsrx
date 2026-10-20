@@ -1,7 +1,7 @@
-import { useContext, useRef, useSyncExternalStore } from 'octane';
+import { useContext, useEffect, useRef, useSyncExternalStore } from 'octane';
 import type { OctaneNode } from 'octane';
 import { SeoContext } from './context.ts';
-import { createSeoRegistry, type SeoRegistry } from './registry.ts';
+import { createSeoRegistry, revertUncommittedSeoSources, type SeoRegistry } from './registry.ts';
 import { linkKey, metaKey, type MetaAttributes, type SeoDescriptor } from './descriptors.ts';
 import { expandSeo, jsonLdDescriptor, type SeoInput } from './expand.ts';
 import { useRegisterSeo } from './useRegister.ts';
@@ -57,6 +57,10 @@ function SeoOutlet() @{
 		registry.getSnapshot,
 		registry.getSnapshot,
 	);
+	useEffect(() => {
+		revertUncommittedSeoSources(registry);
+		registry.flush();
+	}, [descriptors]);
 	<>
 		@for (const descriptor of descriptors; key descriptor.key) {
 			<SeoTag descriptor={descriptor} />

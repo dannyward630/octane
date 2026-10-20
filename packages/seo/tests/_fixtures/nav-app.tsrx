@@ -50,6 +50,30 @@ function Renaming() @{
 	</>
 }
 
+function FailingBody() {
+	throw new Error('page failed');
+}
+
+function FailedMetadata() @{
+	const [show, setShow] = useState(true);
+	<>
+		@if (show) {
+			@try {
+				<>
+					<Title text="Discarded" />
+					<Meta name="robots" content="noindex" />
+					<FailingBody />
+				</>
+			} @catch {
+				<p id="caught">caught</p>
+			}
+		}
+		<button id="remove-failed" onClick={() => setShow(false)}>
+			remove failed branch
+		</button>
+	</>
+}
+
 export function NavApp() @{
 	const [route, setRoute] = useState('home');
 	<Head>
@@ -68,6 +92,9 @@ export function NavApp() @{
 			<button id="to-renaming" onClick={() => setRoute('renaming')}>
 				renaming
 			</button>
+			<button id="to-failed" onClick={() => setRoute('failed')}>
+				failed
+			</button>
 		</nav>
 		@switch (route) {
 			@case 'home': {
@@ -78,6 +105,9 @@ export function NavApp() @{
 			}
 			@case 'toggling': {
 				<Toggling />
+			}
+			@case 'failed': {
+				<FailedMetadata />
 			}
 			@default: {
 				<Renaming />
