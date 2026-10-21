@@ -514,6 +514,15 @@ function findPortalAncestor(block: Block | null): Block | null {
 	return block;
 }
 
+function findAncestorFormInBlocks(block: Block | null): HTMLFormElement | null {
+	while (block !== null) {
+		const parent = block.parentNode;
+		if ((parent as any).nodeName === 'FORM') return parent as HTMLFormElement;
+		block = block.parentBlock;
+	}
+	return null;
+}
+
 function findAncestorForm(block: Block): HTMLFormElement | null {
 	// Start above the range: a single-root Block's start is its own root element,
 	// which may be the <form> this component renders.
@@ -524,14 +533,27 @@ function findAncestorForm(block: Block): HTMLFormElement | null {
 		// Portal children live in a foreign DOM tree. Stop at its target and resume
 		// from the portal's logical host, which is available before the body renders.
 		if (portal !== null && n === portal.parentNode) {
-			n =
-				(portal.startMarker as (Node & { $$portalParent?: Node }) | null)?.$$portalParent ??
-				n.parentNode;
+			const host = (portal.startMarker as (Node & { $$portalParent?: Node }) | null)
+				?.$$portalParent;
+			// A host built in a frontier is detached until commit, so walking its
+			// DOM parents cannot reach an ancestor form from this first render.
+			if (host !== undefined && !host.isConnected) {
+				const form = findAncestorFormInBlocks(portal.parentBlock);
+				if (form !== null) return form;
+			}
+			n = host ?? n.parentNode;
 			portal = findPortalAncestor(portal.parentBlock);
 			continue;
 		}
 		if ((n as any).nodeName === 'FORM') return n as HTMLFormElement;
-		n = n.parentNode;
+		const parent = n.parentNode;
+		// A frontier is detached during render; its slot records the parent it
+		// will commit into, which is still part of this component's source tree.
+		n =
+			parent ??
+			(n.nodeType === 11
+				? ((n as DocumentFragment & { $$next?: { parent: Node | null } }).$$next?.parent ?? null)
+				: null);
 	}
 	return null;
 }

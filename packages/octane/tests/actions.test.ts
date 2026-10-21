@@ -5,6 +5,7 @@ import {
 	ActionForm,
 	SubmitterActionForm,
 	FormWithStatus,
+	FrontierPortaledFormWithStatus,
 	PortaledFormWithStatus,
 	RawFormWithStatus,
 	StatusProbe,
@@ -272,6 +273,54 @@ describe('useFormStatus', () => {
 			expect(button.textContent).toBe('pending:edited');
 			expect(button.disabled).toBe(true);
 			expect(button.getAttribute('data-scope')).toBe('owned');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('resolves a portaled form status when its source wrapper is still in a frontier', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(FrontierPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form') as HTMLFormElement;
+			expect(target.querySelector('#portal-status')).toBeNull();
+
+			// The form is already committed; the new wrapper and its portal mount
+			// together through a detached frontier on this update.
+			flushSync(() => showPortal());
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+			expect(button.getAttribute('data-scope')).toBe('frontier');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+			expect(button.disabled).toBe(true);
+			expect(button.getAttribute('data-scope')).toBe('frontier');
 
 			d.resolve();
 			await settle();

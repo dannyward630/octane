@@ -82,6 +82,23 @@ export function PortaledFormWithStatus(props: {
 	</PortalStatusContext>
 }
 
+export function FrontierPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="frontier">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			@if (show) {
+				<div id="portal-frontier">{createPortal(<PortaledStatusButton />, props.target)}</div>
+			}
+		</form>
+	</PortalStatusContext>
+}
+
 // RAW <form action={fn}> (not useActionState) + a useFormStatus child. Used to
 // verify a SYNCHRONOUSLY-throwing action still clears the form's pending status.
 export function RawFormWithStatus(props) @{
