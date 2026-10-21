@@ -516,8 +516,26 @@ function findPortalAncestor(block: Block | null): Block | null {
 
 function findAncestorFormInBlocks(block: Block | null): HTMLFormElement | null {
 	while (block !== null) {
-		const parent = block.parentNode;
-		if ((parent as any).nodeName === 'FORM') return parent as HTMLFormElement;
+		let n: Node | null = block.parentNode;
+		let portal = findPortalAncestor(block);
+		while (n !== null) {
+			// A block inside a portal can have a target form as its DOM parent. Cross
+			// that portal before treating any form in the target tree as an ancestor.
+			if (portal !== null && n === portal.parentNode) {
+				const host = (portal.startMarker as (Node & { $$portalParent?: Node }) | null)
+					?.$$portalParent;
+				n = host ?? n.parentNode;
+				portal = findPortalAncestor(portal.parentBlock);
+				continue;
+			}
+			if ((n as any).nodeName === 'FORM') return n as HTMLFormElement;
+			const parent = n.parentNode;
+			n =
+				parent ??
+				(n.nodeType === 11
+					? ((n as DocumentFragment & { $$next?: { parent: Node | null } }).$$next?.parent ?? null)
+					: null);
+		}
 		block = block.parentBlock;
 	}
 	return null;

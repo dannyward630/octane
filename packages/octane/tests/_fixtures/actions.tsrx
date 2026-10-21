@@ -99,6 +99,68 @@ export function FrontierPortaledFormWithStatus(props: {
 	</PortalStatusContext>
 }
 
+export function CommittedWrapperFrontierPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="committed-wrapper">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			<div id="committed-wrapper">
+				@if (show) {
+					<div id="portal-frontier">{createPortal(<PortaledStatusButton />, props.target)}</div>
+				}
+			</div>
+		</form>
+	</PortalStatusContext>
+}
+
+export function NestedPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	outerTarget: HTMLElement;
+	innerTarget: HTMLFormElement;
+}) @{
+	<PortalStatusContext value="nested">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			{createPortal(
+				<div id="outer-portal-host">
+					{createPortal(<PortaledStatusButton />, props.innerTarget)}
+				</div>,
+				props.outerTarget,
+			)}
+		</form>
+	</PortalStatusContext>
+}
+
+export function NestedFrontierPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	outerTarget: HTMLFormElement;
+	innerTarget: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="nested-frontier">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			{createPortal(
+				<div id="outer-portal-host">
+					@if (show) {
+						<div id="inner-portal-frontier">
+							{createPortal(<PortaledStatusButton />, props.innerTarget)}
+						</div>
+					}
+				</div>,
+				props.outerTarget,
+			)}
+		</form>
+	</PortalStatusContext>
+}
+
 // RAW <form action={fn}> (not useActionState) + a useFormStatus child. Used to
 // verify a SYNCHRONOUSLY-throwing action still clears the form's pending status.
 export function RawFormWithStatus(props) @{
