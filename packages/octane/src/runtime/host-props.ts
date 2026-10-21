@@ -1234,9 +1234,8 @@ export function setClassName(el: Element, value: unknown, foreign?: boolean): vo
 	else (el as any).className = cls;
 }
 
-// Attribute-based class setter: SVG/MathML compiled TEMPLATE bindings (where
-// `className` is a read-only SVGAnimatedString so the fast `setClassName` can't be
-// used), and every runtime host's class (spreads, descriptors) route here.
+// Attribute-based class setter: SVG/MathML compiled template bindings (where
+// `className` is a read-only SVGAnimatedString) and direct class bindings.
 // clsx-composes the value; a nullish/false value REMOVES the attribute (parity with
 // the generic setAttribute this binding routed through before clsx composition
 // existed).
@@ -1248,12 +1247,6 @@ export function setClassAttr(el: Element, value: unknown): void {
 		return;
 	}
 	if (TRANSITION_JOURNAL !== null) journalBag();
-	// A staged write must still reassert its authored value when it publishes.
-	if (
-		(ROOT_RENDER_TRANSACTION === null || pendingWrites(CURRENT_BLOCK) === null) &&
-		el.getAttribute('class') === cls
-	)
-		return;
 	if (cls === null) el.removeAttribute('class');
 	else el.setAttribute('class', cls);
 }
@@ -1894,6 +1887,26 @@ function skipSpreadKey(el: Element, k: string, flags: number): boolean {
 	);
 }
 
+// Fresh host props can normalize to the class already on a spread's element.
+// Keep direct compiler class bindings on setClassAttr's write-only path.
+function setHostPropClassAttr(el: Element, value: unknown): void {
+	const cls = value == null || value === false ? null : normalizeClass(value);
+	if (hydrating && CURSOR !== null) {
+		CURSOR.adopts(el);
+		if (process.env.NODE_ENV !== 'production') unpatchedClass(CURSOR, el, cls, false);
+		return;
+	}
+	if (TRANSITION_JOURNAL !== null) journalBag();
+	// A staged write must still reassert its authored value when it publishes.
+	if (
+		(ROOT_RENDER_TRANSACTION === null || pendingWrites(CURRENT_BLOCK) === null) &&
+		el.getAttribute('class') === cls
+	)
+		return;
+	if (cls === null) el.removeAttribute('class');
+	else el.setAttribute('class', cls);
+}
+
 // The one generic host-prop writer, for spreads and element descriptors: it
 // diffs `prev` → `value` (`prev` is undefined on mount) by identity, removing a
 // vanished prop through the removal that mirrors its setter. Bindings whose
@@ -2013,7 +2026,7 @@ export function setHostProps(
 			if (v === pv && !initialHydration) continue;
 			// Hydration-aware + SVG-safe class write (suppress/warn parity with a
 			// direct class binding); nullish/false removes the attribute.
-			setClassAttr(el, v);
+			setHostPropClassAttr(el, v);
 			continue;
 		}
 		if (k === 'style') {
