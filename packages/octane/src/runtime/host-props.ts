@@ -1248,6 +1248,12 @@ export function setClassAttr(el: Element, value: unknown): void {
 		return;
 	}
 	if (TRANSITION_JOURNAL !== null) journalBag();
+	// A staged write must still reassert its authored value when it publishes.
+	if (
+		(ROOT_RENDER_TRANSACTION === null || pendingWrites(CURRENT_BLOCK) === null) &&
+		el.getAttribute('class') === cls
+	)
+		return;
 	if (cls === null) el.removeAttribute('class');
 	else el.setAttribute('class', cls);
 }
