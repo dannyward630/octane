@@ -549,9 +549,8 @@ export async function applyInit(ctx, project, options) {
 		validateTypescriptSpecifier(typescriptChoice, installedPeerRange);
 	}
 	const installedTypescript = readInstalled(project.root, 'typescript');
-	const typescriptForConfig =
-		typescriptChoice ?? declared.typescript ?? installedTypescript?.version;
-	const nativeTypeScript = needsContentMapper(typescriptForConfig);
+	// A declared range can include 7.1 even while the installed compiler is 5.9 or 6.
+	const nativeTypeScript = needsContentMapper(typescriptChoice ?? installedTypescript?.version);
 	const needsTypeScript = typescriptChoice !== undefined || !declared.typescript;
 	const integration = integrationFor(project.bundler, mode);
 	const { changes, manual } = plan(project, mode, integration, nativeTypeScript);

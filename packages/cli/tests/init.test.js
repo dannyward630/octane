@@ -485,6 +485,37 @@ describe('octane init', () => {
 		expect(requested).not.toContain('typescript');
 	});
 
+	it('uses the installed TypeScript version when a declared range includes the nightly', async () => {
+		const peerRange = '^5.9.3 || ^6.0.0 || ^7.1.0-dev.20260923.1';
+		const { root } = fixture({
+			'package.json': {
+				name: 'ready-app',
+				type: 'module',
+				dependencies: { octane: '^0.10.0' },
+				devDependencies: {
+					'@tsrx/typescript-plugin': '^0.3.118',
+					typescript: peerRange,
+				},
+			},
+			'tsconfig.json': {
+				compilerOptions: {
+					jsxImportSource: 'octane',
+					plugins: [{ name: '@tsrx/typescript-plugin' }],
+				},
+			},
+			...installed('typescript', '5.9.3'),
+			...installed('@tsrx/typescript-plugin', '0.3.118', {
+				peerDependencies: { typescript: peerRange },
+			}),
+		});
+		const recorder = recordingExec();
+
+		await runCli(['init', '--cwd', root, '--mode', 'spa', '--yes'], { exec: recorder.exec });
+
+		expect(JSON.parse(read(root, 'tsconfig.json')).contentMappers).toBeUndefined();
+		expect(recorder.args.flat()).not.toContain('@tsrx/content-mapper');
+	});
+
 	it('accepts a supported TypeScript range from the flag', async () => {
 		const { root } = fixture(
 			installed('@tsrx/typescript-plugin', '0.6.2', {
