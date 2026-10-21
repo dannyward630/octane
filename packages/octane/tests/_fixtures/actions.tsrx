@@ -161,6 +161,25 @@ export function NestedFrontierPortaledFormWithStatus(props: {
 	</PortalStatusContext>
 }
 
+export function FrontierInnerFormPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="frontier-inner-form">
+		<form id="outer-form">
+			@if (show) {
+				<form id="save-form" action={props.action}>
+					<input id="field" name="draft" defaultValue="saved" />
+					{createPortal(<PortaledStatusButton />, props.target)}
+				</form>
+			}
+		</form>
+	</PortalStatusContext>
+}
+
 // RAW <form action={fn}> (not useActionState) + a useFormStatus child. Used to
 // verify a SYNCHRONOUSLY-throwing action still clears the form's pending status.
 export function RawFormWithStatus(props) @{

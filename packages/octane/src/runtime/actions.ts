@@ -516,6 +516,10 @@ function findPortalAncestor(block: Block | null): Block | null {
 
 function findAncestorFormInBlocks(block: Block | null): HTMLFormElement | null {
 	while (block !== null) {
+		// A form can be the root of a block inside the same detached frontier;
+		// prefer it before following that frontier's next parent outward.
+		const root = block.startMarker;
+		if ((root as any)?.nodeName === 'FORM') return root as HTMLFormElement;
 		let n: Node | null = block.parentNode;
 		let portal = findPortalAncestor(block);
 		while (n !== null) {
