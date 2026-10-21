@@ -541,12 +541,11 @@ function findAncestorFormInBlocks(block: Block | null): HTMLFormElement | null {
 	return null;
 }
 
-function findAncestorForm(block: Block): HTMLFormElement | null {
+function findAncestorForm(block: Block, portal: Block | null): HTMLFormElement | null {
 	// Start above the range: a single-root Block's start is its own root element,
 	// which may be the <form> this component renders.
 	const start = block.startMarker;
 	let n: Node | null = start ? start.parentNode : (block.parentNode ?? null);
-	let portal = findPortalAncestor(block);
 	while (n) {
 		// Portal children live in a foreign DOM tree. Stop at its target and resume
 		// from the portal's logical host, which is available before the body renders.
@@ -579,6 +578,9 @@ function findAncestorForm(block: Block): HTMLFormElement | null {
 interface FormStatusSlot {
 	form: HTMLFormElement | null;
 	listener: (() => void) | null;
+	// The owning Block tree is stable for this hook scope; cache its portal edge
+	// so ordinary form-status renders keep the DOM-only ancestor fast path.
+	portal: Block | null;
 }
 
 export function useFormStatus(slot?: HookSlot): FormStatus;
@@ -589,7 +591,7 @@ export function useFormStatus(slot?: HookSlot): FormStatus {
 	const block = CURRENT_BLOCK!;
 	let s = scope.hooks?.get(slot) as FormStatusSlot | undefined;
 	if (s === undefined) {
-		s = { form: null, listener: null };
+		s = { form: null, listener: null, portal: findPortalAncestor(scope.block) };
 		const slotRef = s;
 		ensureHooks(scope).set(slot, slotRef);
 		registerHookCleanup(scope, () => {
@@ -603,7 +605,7 @@ export function useFormStatus(slot?: HookSlot): FormStatus {
 	// would leave the hook stuck reporting idle for a form that showed up later.
 	// Start from this component's own range: a lite Scope's stand-in sits at its
 	// host node, inside any <form> the owning Block renders around it.
-	const form = findAncestorForm(scope.block);
+	const form = findAncestorForm(scope.block, s.portal);
 	if (form !== s.form) {
 		if (s.form && s.listener) FORM_STATUS_LISTENERS.get(s.form)?.delete(s.listener);
 		s.form = form;
