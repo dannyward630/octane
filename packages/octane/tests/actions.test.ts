@@ -8,6 +8,7 @@ import {
 	CommittedWrapperFrontierPortaledFormWithStatus,
 	FrontierPortaledFormWithStatus,
 	FrontierInnerFormPortaledFormWithStatus,
+	FrontierWrappedInnerFormPortaledFormWithStatus,
 	NestedFrontierPortaledFormWithStatus,
 	NestedPortaledFormWithStatus,
 	PortaledFormWithStatus,
@@ -492,6 +493,50 @@ describe('useFormStatus', () => {
 			expect(button.form).toBe(form);
 			expect(button.textContent).toBe('idle');
 			expect(button.getAttribute('data-scope')).toBe('frontier-inner-form');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('walks the detached host before falling back past a wrapper form', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(FrontierWrappedInnerFormPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const outerForm = r.find('#outer-form') as HTMLFormElement;
+			expect(r.container.querySelector('#save-form')).toBeNull();
+
+			flushSync(() => showPortal());
+			const form = r.find('#save-form') as HTMLFormElement;
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(outerForm.contains(form)).toBe(true);
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.getAttribute('data-scope')).toBe('wrapped-frontier-inner-form');
 
 			(r.find('#field') as HTMLInputElement).value = 'edited';
 			flushSync(() => form.requestSubmit(button));

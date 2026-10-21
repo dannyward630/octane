@@ -545,6 +545,23 @@ function findAncestorFormInBlocks(block: Block | null): HTMLFormElement | null {
 	return null;
 }
 
+function findAncestorFormInDetachedHost(node: Node, block: Block | null): HTMLFormElement | null {
+	let portal = findPortalAncestor(block);
+	let n: Node | null = node;
+	while (n !== null) {
+		if (portal !== null && n === portal.parentNode) {
+			const host = (portal.startMarker as (Node & { $$portalParent?: Node }) | null)
+				?.$$portalParent;
+			n = host ?? n.parentNode;
+			portal = findPortalAncestor(portal.parentBlock);
+			continue;
+		}
+		if ((n as any).nodeName === 'FORM') return n as HTMLFormElement;
+		n = n.parentNode;
+	}
+	return null;
+}
+
 function findAncestorForm(block: Block, portal: Block | null): HTMLFormElement | null {
 	// Start above the range: a single-root Block's start is its own root element,
 	// which may be the <form> this component renders.
@@ -559,6 +576,8 @@ function findAncestorForm(block: Block, portal: Block | null): HTMLFormElement |
 			// A host built in a frontier is detached until commit, so walking its
 			// DOM parents cannot reach an ancestor form from this first render.
 			if (host !== undefined && !host.isConnected) {
+				const localForm = findAncestorFormInDetachedHost(host, portal.parentBlock);
+				if (localForm !== null) return localForm;
 				const form = findAncestorFormInBlocks(portal.parentBlock);
 				if (form !== null) return form;
 			}
