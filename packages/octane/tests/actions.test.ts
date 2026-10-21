@@ -5,6 +5,7 @@ import {
 	ActionForm,
 	SubmitterActionForm,
 	FormWithStatus,
+	PortaledFormWithStatus,
 	RawFormWithStatus,
 	StatusProbe,
 	SelfFormStatus,
@@ -241,6 +242,47 @@ describe('useFormStatus', () => {
 		await settle();
 		expect(r.find('#status').textContent).toBe('idle');
 		r.unmount();
+	});
+
+	it('reports the logical ancestor form’s pending status through a portal', async () => {
+		const d = deferred();
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(PortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form');
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+			expect(button.getAttribute('data-scope')).toBe('owned');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => (form as HTMLFormElement).requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+			expect(button.disabled).toBe(true);
+			expect(button.getAttribute('data-scope')).toBe('owned');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
 	});
 
 	it('keeps the form pending until ALL queued submits drain', async () => {

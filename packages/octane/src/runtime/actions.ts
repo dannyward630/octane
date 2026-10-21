@@ -509,12 +509,27 @@ export function useActionState<S>(
 // when there is no ancestor form or no active submission.
 // ---------------------------------------------------------------------------
 
+function findPortalAncestor(block: Block | null): Block | null {
+	while (block !== null && block.kind !== 'portal') block = block.parentBlock;
+	return block;
+}
+
 function findAncestorForm(block: Block): HTMLFormElement | null {
 	// Start above the range: a single-root Block's start is its own root element,
 	// which may be the <form> this component renders.
 	const start = block.startMarker;
 	let n: Node | null = start ? start.parentNode : (block.parentNode ?? null);
+	let portal = findPortalAncestor(block);
 	while (n) {
+		// Portal children live in a foreign DOM tree. Stop at its target and resume
+		// from the portal's logical host, which is available before the body renders.
+		if (portal !== null && n === portal.parentNode) {
+			n =
+				(portal.startMarker as (Node & { $$portalParent?: Node }) | null)?.$$portalParent ??
+				n.parentNode;
+			portal = findPortalAncestor(portal.parentBlock);
+			continue;
+		}
 		if ((n as any).nodeName === 'FORM') return n as HTMLFormElement;
 		n = n.parentNode;
 	}
