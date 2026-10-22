@@ -2026,7 +2026,8 @@ export function setHostProps(
 			if (v === pv && !initialHydration) continue;
 			// Hydration-aware + SVG-safe class write (suppress/warn parity with a
 			// direct class binding); nullish/false removes the attribute.
-			setHostPropClassAttr(el, v);
+			if (descriptor) setClassAttr(el, v);
+			else setHostPropClassAttr(el, v);
 			continue;
 		}
 		if (k === 'style') {

@@ -39,6 +39,8 @@ const SpreadGate = (props: { value: unknown; gate?: PromiseLike<unknown> }) =>
 		props.gate ? createElement(SpreadGateBoundary, { promise: props.gate }) : null,
 	);
 
+const DescriptorClass = (props: { value: unknown }) => createElement('div', { class: props.value });
+
 const SpreadGateBoundary = (props: { promise: PromiseLike<unknown> }) => {
 	use(props.promise);
 	return null;
@@ -250,6 +252,24 @@ describe('clsx class composition — client mount', () => {
 		// SVGElement.className is an SVGAnimatedString — read the attribute directly.
 		expect(r.find('svg').getAttribute('class')).toBe('a b');
 		r.unmount();
+	});
+
+	it('keeps descriptor class writes on the existing write-only path', () => {
+		const r = mount(DescriptorClass, { value: ['base', 'active'] });
+		const div = r.find('div');
+		const observer = new MutationObserver(() => {});
+		const getAttribute = vi.spyOn(Element.prototype, 'getAttribute');
+		observer.observe(div, { attributes: true, attributeFilter: ['class'] });
+		try {
+			r.update(DescriptorClass, { value: ['base', 'active'] });
+			expect(div.className).toBe('base active');
+			expect(observer.takeRecords()).toHaveLength(1);
+			expect(getAttribute.mock.calls.filter(([name]) => name === 'class')).toHaveLength(0);
+		} finally {
+			getAttribute.mockRestore();
+			observer.disconnect();
+			r.unmount();
+		}
 	});
 
 	it('recomposes across updates', () => {
