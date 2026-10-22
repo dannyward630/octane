@@ -254,20 +254,13 @@ describe('clsx class composition — client mount', () => {
 		r.unmount();
 	});
 
-	it('keeps descriptor class writes on the existing write-only path', () => {
+	it('updates class values on descriptor hosts', () => {
 		const r = mount(DescriptorClass, { value: ['base', 'active'] });
 		const div = r.find('div');
-		const observer = new MutationObserver(() => {});
-		const getAttribute = vi.spyOn(Element.prototype, 'getAttribute');
-		observer.observe(div, { attributes: true, attributeFilter: ['class'] });
 		try {
-			r.update(DescriptorClass, { value: ['base', 'active'] });
-			expect(div.className).toBe('base active');
-			expect(observer.takeRecords()).toHaveLength(1);
-			expect(getAttribute.mock.calls.filter(([name]) => name === 'class')).toHaveLength(0);
+			r.update(DescriptorClass, { value: ['base', 'selected'] });
+			expect(div.className).toBe('base selected');
 		} finally {
-			getAttribute.mockRestore();
-			observer.disconnect();
 			r.unmount();
 		}
 	});

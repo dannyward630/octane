@@ -1889,7 +1889,7 @@ function skipSpreadKey(el: Element, k: string, flags: number): boolean {
 
 // Fresh host props can normalize to the class already on a spread's element.
 // Keep direct compiler class bindings on setClassAttr's write-only path.
-function setHostPropClassAttr(el: Element, value: unknown): void {
+function setHostPropClassAttr(el: Element, value: unknown, prevValue: unknown): void {
 	const cls = value == null || value === false ? null : normalizeClass(value);
 	if (hydrating && CURSOR !== null) {
 		CURSOR.adopts(el);
@@ -1897,12 +1897,12 @@ function setHostPropClassAttr(el: Element, value: unknown): void {
 		return;
 	}
 	if (TRANSITION_JOURNAL !== null) journalBag();
-	// A staged write must still reassert its authored value when it publishes.
-	if (
-		(ROOT_RENDER_TRANSACTION === null || pendingWrites(CURRENT_BLOCK) === null) &&
-		el.getAttribute('class') === cls
-	)
-		return;
+	// Compare the DOM only when the authored class could already match. Changed
+	// values need a write, while a staged write must reassert its value at publish.
+	if (ROOT_RENDER_TRANSACTION === null || pendingWrites(CURRENT_BLOCK) === null) {
+		const prevCls = prevValue == null || prevValue === false ? null : normalizeClass(prevValue);
+		if (prevCls === cls && el.getAttribute('class') === cls) return;
+	}
 	if (cls === null) el.removeAttribute('class');
 	else el.setAttribute('class', cls);
 }
@@ -2027,7 +2027,7 @@ export function setHostProps(
 			// Hydration-aware + SVG-safe class write (suppress/warn parity with a
 			// direct class binding); nullish/false removes the attribute.
 			if (descriptor) setClassAttr(el, v);
-			else setHostPropClassAttr(el, v);
+			else setHostPropClassAttr(el, v, pv);
 			continue;
 		}
 		if (k === 'style') {
