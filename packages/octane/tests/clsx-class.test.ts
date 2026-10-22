@@ -157,6 +157,42 @@ describe('clsx class composition — client mount', () => {
 		},
 	);
 
+	it('does not reread a retained spread class object on a later update', () => {
+		let reads = 0;
+		const active = Object.create(null);
+		Object.defineProperty(active, 'active', {
+			enumerable: true,
+			get() {
+				reads++;
+				if (reads > 1) throw new Error('retained class object was read again');
+				return true;
+			},
+		});
+		const initialClass = ['base', active];
+		const r = mount(SpreadClass, { class: initialClass });
+		const div = r.find('div');
+		const observer = new MutationObserver(() => {});
+		observer.observe(div, { attributes: true, attributeFilter: ['class'] });
+		try {
+			expect(div.className).toBe('base active');
+			r.update(SpreadClass, { class: initialClass });
+			expect(observer.takeRecords()).toHaveLength(0);
+
+			r.update(SpreadClass, { class: ['base', 'active'] });
+			expect(div.className).toBe('base active');
+			expect(observer.takeRecords()).toHaveLength(0);
+			expect(reads).toBe(1);
+
+			r.update(SpreadClass, { class: ['base', 'selected'] });
+			expect(div.className).toBe('base selected');
+			expect(reads).toBe(1);
+			expect(observer.takeRecords()).toHaveLength(1);
+		} finally {
+			observer.disconnect();
+			r.unmount();
+		}
+	});
+
 	it('keeps absent and empty spread classes distinct', () => {
 		const r = mount(SpreadClass, { class: '' });
 		const div = r.find('div');
