@@ -1887,42 +1887,25 @@ function skipSpreadKey(el: Element, k: string, flags: number): boolean {
 	);
 }
 
-const SPREAD_CLASS_SNAPSHOTS = new WeakMap<object, string | null>();
-const SPREAD_CLASS_NAME_SNAPSHOTS = new WeakMap<object, string | null>();
+// Reuse normalized strings without revisiting retained user objects or keeping them alive.
+const SPREAD_CLASS_VALUES = /* @__PURE__ */ new WeakMap<object, string | null>();
 
-function spreadClassSnapshotCache(name: 'class' | 'className'): WeakMap<object, string | null> {
-	return name === 'class' ? SPREAD_CLASS_SNAPSHOTS : SPREAD_CLASS_NAME_SNAPSHOTS;
-}
-
-function propagateSpreadClassSnapshot(
-	value: unknown,
-	prev: unknown,
-	name: 'class' | 'className',
-): void {
-	if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return;
-	if (prev === null || (typeof prev !== 'object' && typeof prev !== 'function')) return;
-	const cache = spreadClassSnapshotCache(name);
-	const normalized = cache.get(prev);
-	if (normalized !== undefined) cache.set(value, normalized);
+function previousSpreadClass(value: unknown): string | null | undefined {
+	if (value == null || value === false) return null;
+	if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+		return normalizeClass(value);
+	if ((typeof value === 'object' && value !== null) || typeof value === 'function')
+		return SPREAD_CLASS_VALUES.get(value);
+	return undefined;
 }
 
 // Fresh host props can normalize to the class already on a spread's element.
 // Keep direct compiler class bindings on setClassAttr's write-only path.
-function setHostPropClassAttr(
-	el: Element,
-	classValue: unknown,
-	props: unknown,
-	prevProps: unknown,
-	name: 'class' | 'className',
-): void {
-	const cls = classValue == null || classValue === false ? null : normalizeClass(classValue);
-	const cache = spreadClassSnapshotCache(name);
-	const prevCls =
-		prevProps !== null && (typeof prevProps === 'object' || typeof prevProps === 'function')
-			? cache.get(prevProps)
-			: undefined;
-	if (props !== null && (typeof props === 'object' || typeof props === 'function'))
-		cache.set(props, cls);
+function setHostPropClassAttr(el: Element, value: unknown, prevValue: unknown): void {
+	const prevCls = previousSpreadClass(prevValue);
+	const cls = value == null || value === false ? null : normalizeClass(value);
+	if ((typeof value === 'object' && value !== null) || typeof value === 'function')
+		SPREAD_CLASS_VALUES.set(value, cls);
 	if (hydrating && CURSOR !== null) {
 		CURSOR.adopts(el);
 		if (process.env.NODE_ENV !== 'production') unpatchedClass(CURSOR, el, cls, false);
@@ -2056,14 +2039,11 @@ export function setHostProps(
 		)
 			continue; // JS-only state stamped before the loops (see above)
 		if (k === 'class' || k === 'className') {
-			if (v === pv && !initialHydration) {
-				if (!descriptor) propagateSpreadClassSnapshot(value, prev, k);
-				continue;
-			}
+			if (v === pv && !initialHydration) continue;
 			// Hydration-aware + SVG-safe class write (suppress/warn parity with a
 			// direct class binding); nullish/false removes the attribute.
 			if (descriptor) setClassAttr(el, v);
-			else setHostPropClassAttr(el, v, value, prev, k);
+			else setHostPropClassAttr(el, v, pv);
 			continue;
 		}
 		if (k === 'style') {
