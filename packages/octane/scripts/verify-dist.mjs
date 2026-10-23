@@ -68,6 +68,7 @@ export const REQUIRED_PUBLIC_VALUE_EXPORTS = {
 		'cloneElement',
 		'compilerCacheContext',
 		'componentSlot',
+		'componentSlotFunction',
 		'componentSlotLite',
 		'componentSlotVoid',
 		'createContext',
@@ -367,6 +368,7 @@ export const REQUIRED_PUBLIC_VALUE_EXPORTS = {
 	'./internal/hydration-signal': ['__hydrationSignalRevision'],
 	'./internal/hydration-query': ['__beginHydrationQueryRead', '__readHydrationQueryInput'],
 	'./internal/context': ['isContext', 'registerContext'],
+	'./internal/universal-children': ['createUniversalChildren', 'descriptorChildren'],
 	'./internal/client': [
 		'queueOwnRefDetach',
 		'replaceRef',

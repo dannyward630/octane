@@ -510,6 +510,8 @@ export interface TransitionActionBatch {
 	waiting: number;
 	/** Set once its work and every hold are over (finishTransitionHookBatch). */
 	finished: boolean;
+	/** Runtime callbacks waiting for this batch's work and every hold to finish. */
+	finishListeners: Set<() => void> | null;
 	/** Holds keeping it from rendering (TransitionHold.suspends). */
 	suspended: number;
 	/** Profile builds only: queued updates as (cell, block, cause, slot) quadruples. */
@@ -554,7 +556,8 @@ export interface RootRenderOwner {
 	hydrationFallback?: ((failed: boolean) => SlotNext | null) | undefined;
 	bindingContainer?: Node;
 	adopt?: ((block: Block) => void) | undefined;
-	retry: () => void;
+	/** Render the latest request again; `deferred` renders it as a spawned deferred pass. */
+	retry: (deferred?: boolean) => void;
 	request: ((mode: 'urgent' | 'transition') => void) | null;
 	generation: number;
 	wakeable: PromiseLike<unknown> | null;
@@ -589,7 +592,7 @@ export interface RootRenderTransaction {
 	retired: Set<Block> | null;
 	/**
 	 * The commit queue: `(fn, target)` pairs that commitRootRenders runs in render
-	 * order, before refs and layout effects. A template queues `(C, bag)`
+	 * order, before refs and layout effects. A template queues `(commitQueuedBag, bag)`
 	 * (bagDone); a slot whose structure changed queues `(applySlotNext, slot)`
 	 * when it starts reconciling, ahead of its descendants' entries. A dropped
 	 * window truncates the queue and touches no DOM (dropRootOps).

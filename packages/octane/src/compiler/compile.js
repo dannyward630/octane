@@ -9354,6 +9354,37 @@ function isReturnJsxFunction(node) {
 	return false;
 }
 
+// An uppercase `const X = (…) => <jsx/>` (or function expression, or a
+// single-argument `memo(…)` of one) exported by name or through
+// `export default X`. It compiles as a plain value, so HMR registers its binding
+// rather than a lowered component declaration.
+/** @param {any} node @param {Set<string>} defaultNames @param {(callee: any) => boolean} isMemoCallee @returns {{ name: string, exportKind: 'named' | 'default', memo: boolean } | null} */
+function hmrValueComponent(node, defaultNames, isMemoCallee) {
+	const exported = node.type === 'ExportNamedDeclaration';
+	const declaration = exported ? node.declaration : node;
+	if (
+		declaration?.type !== 'VariableDeclaration' ||
+		declaration.kind !== 'const' ||
+		declaration.declarations.length !== 1
+	)
+		return null;
+	const declarator = declaration.declarations[0];
+	if (declarator.id?.type !== 'Identifier' || !/^[A-Z]/.test(declarator.id.name)) return null;
+	const name = declarator.id.name;
+	if (!exported && !defaultNames.has(name)) return null;
+	const init = declarator.init;
+	const memo =
+		init?.type === 'CallExpression' && init.arguments.length === 1 && isMemoCallee(init.callee);
+	const fn = unwrapTsExpr(memo ? init.arguments[0] : init);
+	if (fn?.type !== 'ArrowFunctionExpression' && fn?.type !== 'FunctionExpression') return null;
+	if (fn.async || fn.generator || !fn.body) return null;
+	const returnsJsx =
+		fn.body.type === 'BlockStatement'
+			? fn.body.body.some(statementHasOwnedJsxReturn)
+			: isJsxNode(fn.body);
+	return returnsJsx ? { name, exportKind: exported ? 'named' : 'default', memo } : null;
+}
+
 /** @param {any} stmt @returns {boolean} */
 function statementHasOwnedJsxReturn(stmt) {
 	if (!stmt) return false;
@@ -10396,7 +10427,7 @@ function runtimeExportBindings(body) {
 		if (node.type === 'ExportAllDeclaration') {
 			bindings.push([null, null]);
 		} else if (node.type === 'ExportDefaultDeclaration') {
-			const value = node.declaration;
+			const value = unwrapTsExpr(node.declaration);
 			bindings.push([
 				'default',
 				value.type === 'Identifier'
@@ -12077,6 +12108,16 @@ function compileAuthored(source, filename, options, bundlerMetadata, analyzed = 
 	return result;
 }
 
+// Directives must precede generated imports and setup to remain a module prologue.
+function moduleDirectives(body) {
+	const directives = [];
+	for (const statement of body) {
+		if (typeof statement.directive !== 'string') break;
+		directives.push(statement);
+	}
+	return directives;
+}
+
 function compileInternal(
 	source,
 	filename,
@@ -12622,6 +12663,7 @@ function compileInternal(
 		hoistedTemplates: [], // { name, ast, html, ns, frag, origins }
 		internedTemplates: new Map(), // HTML -> one template or namespace/fragment variants
 		hoistedHelpers: [], // statement NODES (sub-components, hook Symbols, key fns) + hook-slot-base markers
+		commitFunctions: new Map(), // structural key -> { name, body } of a shared commit function (emitCommitFunction)
 		delegatedEvents: new Set(), // bubble event names seen in JSX — auto-emits delegateEvents(...)
 		capturedEvents: new Set(), // capture-phase event names (onXxxCapture) — auto-emits delegateCaptureEvents(...)
 		// Descriptor capabilities this module's JSX values can select (see
@@ -12688,6 +12730,11 @@ function compileInternal(
 		// single module print must carry a loc (OCTANE_COMPILE_ASSERT_LOC).
 		_moduleOrigin: ast.body.find((n) => n?.loc != null) ?? ast,
 	};
+	if (ctx.inspect) {
+		for (const unit of [options?.__universal, ...universalUnits]) {
+			for (const sheet of unit?.styles ?? []) claimCssOrigins(ctx, sheet);
+		}
+	}
 	ctx.privateWarmLists = source.includes('@for') ? collectPrivateWarmLists(ast.body) : null;
 	if (hookDepHelperLocal !== null) {
 		ctx.runtimeNeeded.add(METHOD_DEP_IMPORT);
@@ -13478,8 +13525,41 @@ function compileInternal(
 	// esrap at the end, which also yields the entire module source map.
 	ctx.hydrationPropsModule = ast;
 	const bodyNodes = emitServerModuleClientStubs(serverModuleInfo, ctx);
+	const directiveNodes = moduleDirectives(ast.body);
 	const compileOpts = { hmrWrap: hmrEnabled, hmrMutable: hmrEnabled };
-	for (let node of ast.body) {
+	// Exported `const X = () => <jsx/>` components stay plain values; HMR rebinds
+	// them like lowered components. Keyed by authored top-level statement.
+	const hmrValueComponents = new Map();
+	const hmrDefaultValues = new Set();
+	const hmrDefaultFunctions = new Set();
+	if (
+		hmrEnabled &&
+		(options?.renderer?.target ?? 'dom') === 'dom' &&
+		universalRuntime === undefined &&
+		options?.__universal == null
+	) {
+		const defaultNames = new Set();
+		for (const node of ast.body)
+			if (
+				node.type === 'ExportDefaultDeclaration' &&
+				unwrapTsExpr(node.declaration)?.type === 'Identifier'
+			)
+				defaultNames.add(unwrapTsExpr(node.declaration).name);
+		for (const node of ast.body) {
+			const component = hmrValueComponent(node, defaultNames, (callee) =>
+				isOctaneMemoCallee(callee, ctx, memoImportNames),
+			);
+			if (
+				(isComponentFunction(node) || isReturnJsxFunction(node)) &&
+				defaultNames.has(node.id.name)
+			)
+				hmrDefaultFunctions.add(node.id.name);
+			if (component === null) continue;
+			hmrValueComponents.set(node, component);
+			if (component.exportKind === 'default') hmrDefaultValues.add(component.name);
+		}
+	}
+	for (let node of ast.body.slice(directiveNodes.length)) {
 		const firstStatement = bodyNodes.length;
 		if (
 			node === serverModuleInfo?.declaration ||
@@ -13487,7 +13567,23 @@ function compileInternal(
 		) {
 			continue;
 		}
-		if (isComponentFunction(node)) {
+		if (hmrDefaultFunctions.has(node.id?.name) && node.type === 'FunctionDeclaration') {
+			// `function Foo() {…}` exported through `export default Foo` compiles
+			// like `export default function Foo() {…}`; that export is dropped below.
+			const c = { ...node, default: true };
+			bodyNodes.push(
+				...(isComponentFunction(node)
+					? compileComponent(c, ctx, compileOpts)
+					: compileReturnJsxFunction(node, ctx, { default: true, ...compileOpts })
+				).nodes,
+			);
+			hmrComponents.push({ name: node.id.name, exportKind: 'default' });
+		} else if (
+			node.type === 'ExportDefaultDeclaration' &&
+			hmrDefaultFunctions.has(unwrapTsExpr(node.declaration)?.name)
+		) {
+			continue;
+		} else if (isComponentFunction(node)) {
 			// `function Foo() @{ ... }` (new TSRX shape) — non-exported helper. HMR
 			// doesn't wrap these (they're not user-visible across module boundaries).
 			bodyNodes.push(...compileComponent(node, ctx).nodes);
@@ -13544,6 +13640,7 @@ function compileInternal(
 			// (`const x = <style>…</style>`, exported or nested in a helper) become
 			// class-map objects and their sheets flow through cssInjections; scoped
 			// blocks inside plain functions' templates get their scope hashes.
+			const valueComponent = hmrValueComponents.get(node);
 			node = applyStyleScopes(node, ctx).node;
 			// HOOKS EVERYWHERE: a plain function (a custom hook, a helper) can hold
 			// octane hooks too — slot them the same way components do, so their base
@@ -13565,7 +13662,61 @@ function compileInternal(
 			const lowered = stampAnonymousDefaultFunctionLoc(rewriteModuleJsxValues(hooked, ctx), ctx);
 			// Top-level passthrough (imports, plain consts/functions): already a
 			// rewritten statement node — embedded directly in the module AST.
-			bodyNodes.push(lowered);
+			if (valueComponent !== undefined) {
+				const name = valueComponent.name;
+				const declaration =
+					lowered.type === 'ExportNamedDeclaration' ? lowered.declaration : lowered;
+				const [declarator] = declaration.declarations;
+				// A memo wrapper keeps its identity and comparator; HMR swaps the body it wraps.
+				const mutable = valueComponent.memo
+					? {
+							...declaration,
+							kind: 'let',
+							declarations: [
+								{
+									...declarator,
+									init: {
+										...declarator.init,
+										arguments: [
+											inheritOriginLoc(
+												b.call('_$hmr', declarator.init.arguments[0]),
+												declarator.init.arguments[0],
+											),
+										],
+									},
+								},
+							],
+						}
+					: { ...declaration, kind: 'let' };
+				bodyNodes.push(lowered === declaration ? mutable : { ...lowered, declaration: mutable });
+				if (!valueComponent.memo)
+					bodyNodes.push(
+						inheritOriginLoc(
+							b.stmt(b.assignment('=', b.id(name), b.call('_$hmr', b.id(name)))),
+							node,
+						),
+					);
+				hmrComponents.push({
+					name,
+					exportKind: valueComponent.exportKind,
+					memo: valueComponent.memo,
+				});
+			} else if (
+				node.type === 'ExportDefaultDeclaration' &&
+				unwrapTsExpr(node.declaration)?.type === 'Identifier' &&
+				hmrDefaultValues.has(unwrapTsExpr(node.declaration).name)
+			) {
+				// A live binding, so the handoff's rebinding reaches importers. An
+				// export specifier cannot carry an `as`/`satisfies` assertion.
+				bodyNodes.push(
+					inheritOriginLoc(
+						b.export(null, [b.export_specifier(unwrapTsExpr(node.declaration).name, 'default')]),
+						node,
+					),
+				);
+			} else {
+				bodyNodes.push(lowered);
+			}
 		}
 		if (ctx.typescriptWeb && node.leadingComments && bodyNodes.length > firstStatement) {
 			bodyNodes[firstStatement] = {
@@ -13679,6 +13830,7 @@ function compileInternal(
 			b.member(b.member(hot(), 'data'), b.id('__octaneComponents'), false, optional);
 		const previousComponent = (component) =>
 			b.member(componentStore(), b.id(componentKey(component)));
+		const hmrBody = (component, value) => (component.memo ? b.member(value, 'type') : value);
 		const handoffs = hmrComponents.map((c) =>
 			b.if(
 				// Newly added exports may be named constructor or __proto__; inherited
@@ -13697,8 +13849,8 @@ function compileInternal(
 						b.unary(
 							'!',
 							b.call(
-								b.member(b.member(previousComponent(c), b.id('_$HMR'), true), 'update'),
-								b.id(c.name),
+								b.member(b.member(hmrBody(c, previousComponent(c)), b.id('_$HMR'), true), 'update'),
+								hmrBody(c, b.id(c.name)),
 							),
 						),
 						b.block([b.stmt(b.call(b.member(hot(), 'invalidate')))]),
@@ -13972,7 +14124,7 @@ function compileInternal(
 	const program = {
 		type: 'Program',
 		sourceType: 'module',
-		body: [...runtimeImportNodes, ...profileRuntimeImportNodes, ...moduleBody],
+		body: [...directiveNodes, ...runtimeImportNodes, ...profileRuntimeImportNodes, ...moduleBody],
 		metadata: { path: [] },
 		start: ast.start,
 		end: ast.end,
@@ -14224,7 +14376,8 @@ function compileServer(
 	}
 	ctx.moduleCssInjections = ctx.cssInjections.slice();
 	const bodyNodes = emitServerModuleServerNodes(serverModuleInfo, ctx);
-	for (const node of ast.body) {
+	const directiveNodes = moduleDirectives(ast.body);
+	for (const node of ast.body.slice(directiveNodes.length)) {
 		const firstStatement = bodyNodes.length;
 		if (
 			node === serverModuleInfo?.declaration ||
@@ -14333,6 +14486,7 @@ function compileServer(
 		type: 'Program',
 		sourceType: 'module',
 		body: [
+			...directiveNodes,
 			...runtimeImportNodes,
 			...nativeActivation,
 			...signalActivation,
@@ -29080,6 +29234,7 @@ function planJsx(
 	const commit = !noTemplate && !ctx.presentationHydration ? makeCommitPlan() : null;
 	const BAG_LOCALS_PLACEHOLDER = `    /*__bagLocals__*/`;
 	if (!noTemplate) mountLines.push(BAG_LOCALS_PLACEHOLDER);
+	const BAG_FACTORY_PLACEHOLDER = `    /*__bagFactory__*/`;
 
 	let elementVars;
 	let ensureVar;
@@ -29221,6 +29376,8 @@ function planJsx(
 		}
 		// Template paths prove the node kind and presence; the runtime's generic
 		// navigation signatures cannot express that compile-time topology.
+		// sibling() steps once by default.
+		const siblingCount = (n) => (n === 1 ? [] : [b.literal(n)]);
 		const typedPath = (expression) =>
 			ctx.typescriptWeb ? b.ts_as(expression, b.ts_keyword_type('any')) : expression;
 		ensureVar = (path) => {
@@ -29257,7 +29414,7 @@ function planJsx(
 				// hydrating); raw `.nextSibling` for hole-free templates. sibVar already resolves to the
 				// (k−sibSteps)-th child, so n steps across lands on the k-th.
 				if (hasHoles) {
-					step = typedPath(b.call('_$sibling', b.id(sibVar), b.literal(sibSteps)));
+					step = typedPath(b.call('_$sibling', b.id(sibVar), ...siblingCount(sibSteps)));
 				} else {
 					step = b.id(sibVar);
 					for (let i = 0; i < sibSteps; i++) step = typedPath(b.member(step, 'nextSibling'));
@@ -29272,7 +29429,7 @@ function planJsx(
 				const parentVar = prefix.length === 0 ? '_root' : ensureVar(prefix);
 				if (hasHoles) {
 					step = typedPath(b.call('_$child', b.id(parentVar)));
-					if (k > 0) step = typedPath(b.call('_$sibling', step, b.literal(k)));
+					if (k > 0) step = typedPath(b.call('_$sibling', step, ...siblingCount(k)));
 				} else {
 					step = typedPath(b.member(b.id(parentVar), 'firstChild'));
 					for (let n = 0; n < k; n++) step = typedPath(b.member(step, 'nextSibling'));
@@ -29675,12 +29832,15 @@ function planJsx(
 					? constArgNode(f.constExpr)
 					: b.id(f.local);
 		const rootArg = () => (single ? b.id('_root') : b.literal(null));
-		if (bag.fields.length <= BAG_FACTORY_MAX) {
-			ctx.runtimeNeeded.add(`bag${bag.fields.length}`);
-			// The arity factory's object literal still declares every field, so an
-			// omitted trailing `undefined` seed keeps the same bag shape.
-			mountLines.push(
-				inheritOriginLoc(
+		const commits = commit !== null && commit.size() > 0;
+		ctx.runtimeNeeded.add(
+			bag.fields.length <= BAG_FACTORY_MAX ? `bag${bag.fields.length}` : 'bagOf',
+		);
+		const factoryLine = (commitName) => {
+			if (bag.fields.length <= BAG_FACTORY_MAX) {
+				// The arity factory's object literal still declares every field, so an
+				// omitted trailing `undefined` seed keeps the same bag shape.
+				return inheritOriginLoc(
 					b.stmt(
 						b.assignment(
 							'=',
@@ -29689,12 +29849,8 @@ function planJsx(
 								`_$bag${bag.fields.length}`,
 								b.id('__s'),
 								rootArg(),
-								...(commit !== null && commit.size() > 0
-									? [
-											...bag.fields.map(bagFieldValue),
-											b.literal(commit.size()),
-											b.id(commitFunctionName(ctx, commit)),
-										]
+								...(commits
+									? [...bag.fields.map(bagFieldValue), b.literal(commit.size()), b.id(commitName)]
 									: optionalCallArgs(
 											...bag.fields.map((f) =>
 												f.constExpr === 'undefined' ? null : bagFieldValue(f),
@@ -29704,44 +29860,39 @@ function planJsx(
 						),
 					),
 					planOrigin,
-				),
-			);
-		} else {
+				);
+			}
 			// Spill path — beyond the shared-factory arities: one inline literal
 			// (still real values, single allocation) through the generic commit.
-			ctx.runtimeNeeded.add('bagOf');
-			mountLines.push(
-				inheritOriginLoc(
-					b.stmt(
-						b.assignment(
-							'=',
-							b.id('_b'),
-							b.call(
-								'_$bagOf',
-								b.id('__s'),
-								rootArg(),
-								b.object([
-									...bag.fields.map((f) => b.prop('init', b.id(f.name), bagFieldValue(f))),
-									// The same state fields as the arity factories (see bagRecord).
-									b.prop('init', b.id('$'), b.literal(commit?.size() ?? 0)),
-									b.prop(
-										'init',
-										b.id('next'),
-										commit !== null && commit.size() > 0
-											? b.id(commitFunctionName(ctx, commit))
-											: b.literal(null),
-									),
-								]),
-								// The compiler owns this literal; opt into rehoming only
-								// when a field actually caches the block's DOM parent.
-								...(bag.hosts.has('__block.parentNode') ? [b.literal(1)] : []),
-							),
+			return inheritOriginLoc(
+				b.stmt(
+					b.assignment(
+						'=',
+						b.id('_b'),
+						b.call(
+							'_$bagOf',
+							b.id('__s'),
+							rootArg(),
+							b.object([
+								...bag.fields.map((f) => b.prop('init', b.id(f.name), bagFieldValue(f))),
+								// The same state fields as the arity factories (see bagRecord).
+								b.prop('init', b.id('$'), b.literal(commit?.size() ?? 0)),
+								b.prop('init', b.id('next'), commits ? b.id(commitName) : b.literal(null)),
+							]),
+							// The compiler owns this literal; opt into rehoming only
+							// when a field actually caches the block's DOM parent.
+							...(bag.hosts.has('__block.parentNode') ? [b.literal(1)] : []),
 						),
 					),
-					planOrigin,
 				),
+				planOrigin,
 			);
-		}
+		};
+		// A commit function is named once its body is known (emitCommitFunction).
+		if (commits) {
+			commit.factory = factoryLine;
+			mountLines.push(BAG_FACTORY_PLACEHOLDER);
+		} else mountLines.push(factoryLine(null));
 		// REF MANIFEST (compiled-output plan, ref-manifest phase): bodies with
 		// ref-carrying bindings stamp a module-scope constant on the scope so the
 		// runtime's suspense-hide walk (detachSubtreeRefs) finds the bag fields
@@ -29831,6 +29982,8 @@ function planJsx(
 	if (commit?.resumed)
 		updateLines.unshift(inheritOriginLoc(commitResumedDeclaration(), planOrigin));
 	const commitName = commit !== null ? emitCommitFunction(ctx, commit, planOrigin) : null;
+	if (commit?.factory)
+		mountLines[mountLines.indexOf(BAG_FACTORY_PLACEHOLDER)] = commit.factory(commitName);
 	if (ctx.scalarBindingClaims) {
 		// Only opted-in scalar views can retain another writer's publication at
 		// hydration. Record their existing cache fields; ordinary output is unchanged.
@@ -29917,7 +30070,7 @@ function planJsx(
 								b.let('_n', b.literal(null)),
 								commitResumedDeclaration(),
 								update,
-								commitDoneStatement(ctx, commitName, planOrigin),
+								commitDoneStatement(ctx, planOrigin),
 							]),
 							planOrigin,
 						)
@@ -30781,11 +30934,7 @@ function planJsx(
 		// this compiled scope; the ordinary component runtime never sees memo deps.
 		if (cc.autoMemoDeps !== null) {
 			const liteMemo = cc.autoMemoLite === true && !cc.inheritRange;
-			const componentHelper = liteMemo
-				? 'componentSlotLite'
-				: cc.voidComponent
-					? 'componentSlotVoid'
-					: 'componentSlot';
+			const componentHelper = liteMemo ? 'componentSlotLite' : componentSlotHelper(cc);
 			const memoAnchor = liteMemo
 				? slotAnchorNodeFor(cc, 'compAnchor')
 				: anchorNodeFor(cc, 'compAnchor');
@@ -30847,8 +30996,9 @@ function planJsx(
 		// when the borrow is declined (incoherent parent regime) and the probe
 		// anchor for transition swaps.
 		if (cc.inheritRange) {
-			const componentHelper = cc.voidComponent ? '_$componentSlotVoid' : '_$componentSlot';
-			ctx.runtimeNeeded.add(cc.voidComponent ? 'componentSlotVoid' : 'componentSlot');
+			const helper = componentSlotHelper(cc);
+			const componentHelper = rtAlias(helper);
+			ctx.runtimeNeeded.add(helper);
 			pushAfterStmt(cc.id, org, {
 				...b.stmt(
 					b.call(
@@ -30896,7 +31046,7 @@ function planJsx(
 			});
 			continue;
 		}
-		const componentHelper = cc.voidComponent ? 'componentSlotVoid' : 'componentSlot';
+		const componentHelper = componentSlotHelper(cc);
 		// Anchor selection — see anchorNodeFor (the endMarker case keeps the
 		// slot's markers inside the block's range so for-of reorder / tryBlock
 		// unmount move the slot DOM along with the block; an element host with
@@ -30934,7 +31084,7 @@ function planJsx(
 	if (holes.length !== 0) {
 		// After the last hole: commit or queue what the holes recorded.
 		const last = holes.reduce((latest, cc) => (cc.id > latest.id ? cc : latest));
-		pushAfterStmt(last.id, planOrigin, commitDoneStatement(ctx, commitName, planOrigin));
+		pushAfterStmt(last.id, planOrigin, commitDoneStatement(ctx, planOrigin));
 	}
 	for (const pc of ctx._portalCalls) {
 		const slotIndex = pc.slotIndex;
@@ -31093,10 +31243,7 @@ function planJsx(
 		everyRender:
 			commitName === null || bindingCells === 0
 				? everyRenderLines
-				: [
-						...everyRenderLines,
-						commitDoneStatement(ctx, commitName, planOrigin, holes.length !== 0),
-					],
+				: [...everyRenderLines, commitDoneStatement(ctx, planOrigin, holes.length !== 0)],
 		commitCells: commitName !== null,
 		after: afterStatements,
 		head: headEmit.head,
@@ -31266,13 +31413,23 @@ const nullNode = () => b.literal(null);
 // undefined. Pass `null` for an absent entry: trailing absent entries are
 // omitted and interior ones become explicit `undefined` placeholders. Only use
 // it for writers that never inspect `arguments.length` (bindSignalText does).
-// componentSlot, componentSlotVoid, and componentSlotLite order their tail after
+// componentSlot, its void and function entries, and componentSlotLite order their tail after
 // `props` by how often a call site supplies it — (invocationSite, anchor,
 // singleRoot, inherit, key, hasKey) — so the common call keeps two of the six.
 function optionalCallArgs(...entries) {
 	let end = entries.length;
 	while (end > 0 && entries[end - 1] == null) end--;
 	return entries.slice(0, end).map((entry) => entry ?? undefinedNode());
+}
+
+// A full component slot's writer: void bodies skip return reconciliation, and
+// proven function tags skip the dynamic host-tag capability.
+function componentSlotHelper(call) {
+	return call.voidComponent
+		? 'componentSlotVoid'
+		: call.functionComponent
+			? 'componentSlotFunction'
+			: 'componentSlot';
 }
 
 // Preserve each selected writer and its first seven arguments. Longer tails
@@ -31282,7 +31439,9 @@ function hydrationComponentInvocation(ctx, call, helper, args) {
 	ctx.runtimeNeeded.add(helper);
 	if (
 		!call.hydrationInput ||
-		(helper !== 'componentSlot' && helper !== 'componentSlotVoid') ||
+		(helper !== 'componentSlot' &&
+			helper !== 'componentSlotVoid' &&
+			helper !== 'componentSlotFunction') ||
 		args.length > 7 ||
 		call.bindingSite
 	) {
@@ -32093,8 +32252,10 @@ function emitBindingMount(bind, elVar, bag) {
 // The template's hoisted commit function walks the cells straight-line, writes
 // each changed one through the ordinary setter, then publishes it:
 //
-//   function _c$7(_b) { const _n = _b.next; let _v; _b.$ &= 255;
+//   function _c$7(_b, _n) { let _v;
 //     if ((_v = _n[3]) !== _b) { _$setText(_b.f, _v); _b.g = _v; } … }
+//
+// Its caller clears the bag's staged state and passes the cells (`_n`).
 //
 // Handler slots and bundles are written in place unless the runtime passes
 // `careful` (`_f`: an open journal or a dispatch in flight). The bag factory
@@ -32135,8 +32296,8 @@ function makeCommitPlan() {
 			size = 0;
 			writes = [];
 		},
-		/** The commit function's name, allocated by commitFunctionName. */
-		name: null,
+		/** Builds the bag factory call once the commit function is named. */
+		factory: null,
 		/** A write takes the commit function's `careful` parameter (`_f`). */
 		careful: false,
 		/** An update binding compares inline, so the update branch declares `_r`. */
@@ -32199,27 +32360,27 @@ function commitCellCount(bind) {
 	return bind.kind === 'styleProperties' ? bind.properties.length : 1;
 }
 
-/** The template's commit function, named once its bag factory needs it. */
-function commitFunctionName(ctx, commit) {
-	commit.name ??= allocCompilerName(ctx, `_c$${ctx.nextHelperId++}`);
-	return commit.name;
-}
-
+/**
+ * The template's commit function. A production build shares byte-identical
+ * ones, as allocTemplate interns templates; dev, HMR and profile builds keep
+ * one per template, so each debugs and maps to its own component.
+ */
 function emitCommitFunction(ctx, commit, origin) {
 	const writes = commit.writes();
-	if (writes.length === 0 && commit.name === null) return null;
-	const name = commitFunctionName(ctx, commit);
+	if (writes.length === 0 && commit.factory === null) return null;
 	const cells = [];
 	for (const make of writes) if (make !== undefined) cells.push(make(commit.size()));
-	const body = [
-		b.const('_n', b.member(b.id('_b'), 'next')),
-		b.declaration('let', [b.declarator('_v')]),
-		// Clear the staged state first: a setter that throws leaves the bag idle,
-		// its committed slots still describing the DOM.
-		b.stmt(b.assignment('&=', b.member(b.id('_b'), '$'), b.literal(COMMIT_MAX_CELLS))),
-		...cells,
-	];
-	const params = commit.careful ? [b.id('_b'), b.id('_f')] : [b.id('_b')];
+	const body = [b.declaration('let', [b.declarator('_v')]), ...cells];
+	const params = [b.id('_b'), b.id('_n'), ...(commit.careful ? [b.id('_f')] : [])];
+	const share = !ctx.hmr && !ctx.dev && !ctx.profile;
+	const key = share ? astStructuralKey([params, body]) : null;
+	const shared = share ? ctx.commitFunctions.get(key) : undefined;
+	if (shared !== undefined) {
+		if (ctx.inspect) aliasSharedOrigins(ctx, body, shared.body, new Set());
+		return shared.name;
+	}
+	const name = allocCompilerName(ctx, `_c$${ctx.nextHelperId++}`);
+	if (share) ctx.commitFunctions.set(key, { name, body });
 	// A body without its own origin (a helper's) takes its first binding's.
 	ctx.hoistedHelpers.push(
 		inheritOriginLoc(
@@ -32228,6 +32389,28 @@ function emitCommitFunction(ctx, commit, origin) {
 		),
 	);
 	return name;
+}
+
+/**
+ * A shared commit function emits only its first template's bindings: alias each
+ * later one onto the node it shares, so inspection still reaches its code. The
+ * two trees match node for node (their structural keys are equal).
+ */
+function aliasSharedOrigins(ctx, copy, canonical, seen) {
+	if (copy === null || typeof copy !== 'object') return;
+	if (Array.isArray(copy)) {
+		for (let i = 0; i < copy.length; i++) aliasSharedOrigins(ctx, copy[i], canonical[i], seen);
+		return;
+	}
+	if (typeof copy.type === 'string' && copy.start != null && canonical.start != null) {
+		const pair = `${copy.start}:${copy.end}:${canonical.start}`;
+		if (!seen.has(pair)) {
+			seen.add(pair);
+			registerOriginAlias(ctx, copy, canonical);
+		}
+	}
+	for (const key of Object.keys(copy))
+		if (!AST_STRUCTURAL_KEY_SKIP.has(key)) aliasSharedOrigins(ctx, copy[key], canonical[key], seen);
 }
 
 /** `_r`: an earlier render of this transaction staged the bag (see bagRecord). */
@@ -32245,9 +32428,9 @@ function commitOwnersDeclaration(ctx) {
 // under 512) commits or queues it here. `reset` when holes record after it: a
 // bag its commit function already wrote (back under 256) stages afresh; a
 // queued one keeps its cells.
-function commitDoneStatement(ctx, name, origin, reset = false) {
+function commitDoneStatement(ctx, origin, reset = false) {
 	ctx.runtimeNeeded.add('bagDone');
-	const done = b.stmt(b.call('_$bagDone', b.id('__s'), b.id('_b'), b.id(name)));
+	const done = b.stmt(b.call('_$bagDone', b.id('__s'), b.id('_b')));
 	return inheritOriginLoc(
 		b.if(
 			b.logical(
@@ -35759,7 +35942,15 @@ function isCheckedCompiledBoundary(node, ctx) {
 		local = tag.object;
 		imported = tag.property.name;
 	}
-	if (imported !== 'CompiledOutlet' && imported !== 'CompiledContext') return false;
+	// Octane's own boundaries render their output imperatively and return
+	// nothing, whatever children or fallback they receive.
+	if (
+		imported !== 'CompiledOutlet' &&
+		imported !== 'CompiledContext' &&
+		imported !== 'Suspense' &&
+		imported !== 'ViewTransition'
+	)
+		return false;
 	if (ctx.currentComponentLocals?.has(local.name)) return false;
 	const binding = activityReferenceBinding(local, node, ctx);
 	return binding?.importSource?.value === 'octane';
@@ -36171,6 +36362,37 @@ function isImmutableComponentTag(tag, ctx) {
 		owner !== null &&
 		lexical.resolveBinding(lexical.nodeScopes.get(tag), tag.name)?.scope === owner.scope
 	);
+}
+
+// A module `const` initialized by Octane's `lazy()` always holds the lazy
+// wrapper, a function, so its call sites never resolve a host string at runtime
+// and can skip the generic entry's dynamic-tag capability.
+function isLazyComponentTag(tag, ctx) {
+	if (tag?.type !== 'JSXIdentifier' && tag?.type !== 'Identifier') return false;
+	const lexical = (ctx.activityLexical ??= createLexicalAnalysis(ctx.activityModuleAst));
+	const scope = lexical.nodeScopes.get(tag);
+	if (scope === undefined || lexical.resolveBinding(scope, tag.name)?.scope !== lexical.rootScope)
+		return false;
+	ctx.lazyComponentBindings ??= collectLazyComponentBindings(ctx, lexical);
+	return ctx.lazyComponentBindings.has(tag.name);
+}
+
+function collectLazyComponentBindings(ctx, lexical) {
+	const names = new Set();
+	for (const statement of ctx.activityModuleAst.body) {
+		const declaration =
+			statement.type === 'ExportNamedDeclaration' ? statement.declaration : statement;
+		if (declaration?.type !== 'VariableDeclaration' || declaration.kind !== 'const') continue;
+		for (const item of declaration.declarations) {
+			const callee = item.init?.type === 'CallExpression' ? item.init.callee : null;
+			if (item.id.type !== 'Identifier' || callee?.type !== 'Identifier') continue;
+			if (ctx.octaneImportLocals?.get(callee.name) !== 'lazy') continue;
+			const binding = lexical.resolveBinding(lexical.nodeScopes.get(callee), callee.name);
+			if (binding?.scope === lexical.rootScope && binding.importSource?.value === 'octane')
+				names.add(item.id.name);
+		}
+	}
+	return names;
 }
 
 function isCompiledHydrateTemplate(node, ctx, attrs) {
@@ -36743,6 +36965,8 @@ function makeCompCall(
 		autoMemoLite: node._octaneBindingSite ? false : autoMemoLite,
 		autoMemoPublicationWitnesses,
 		voidComponent,
+		functionComponent:
+			!voidComponent && isLazyComponentTag(node.openingElement?.name ?? node.id, ctx),
 		singleRoot: node._octaneBindingSite ? false : singleRoot,
 		maybeSingleRoot: node._octaneBindingSite ? false : maybeSingleRoot,
 		loc: devLoc(ctx, node),

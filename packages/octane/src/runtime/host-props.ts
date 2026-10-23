@@ -33,6 +33,7 @@ import {
 } from '../host-property-diagnostics.js';
 import { unpatchedAttribute, unpatchedClass, unpatchedStyle } from '../hydration/dev-values.js';
 import { sanitizeURLAttribute, sanitizeURL } from '../sanitize-url.js';
+import { trustedOr } from '../trusted-types.js';
 import { formatClientError } from '../error-codes.client.generated.js';
 import {
 	normalizeClass,
@@ -300,39 +301,44 @@ export function updateFreshClassAttr(value: unknown, previous: unknown, el: Elem
  */
 export function setScriptText(el: Element, value: any): void {
 	const text = value == null ? '' : String(value);
+	const raw = typeof value === 'object' ? trustedOr(value, text) : text;
 	const transaction = ROOT_RENDER_TRANSACTION === null ? null : pendingWrites(CURRENT_BLOCK);
 	if (transaction !== null) {
-		transaction.ops.push(commitScriptText, [el, text]);
+		transaction.ops.push(commitScriptText, [el, raw]);
 		return;
 	}
+	// An unchanged body writes nothing. A change goes through the script's own
+	// text sink, never its existing Text node, so Trusted Types sees every write:
+	// a TrustedScript reaches it, and an enforcing page rejects a string.
 	const first = getFirstChild(el);
-	if (first !== null && first === el.lastChild && first.nodeType === 3) {
-		updateTextValue(first as Text, text);
-	} else {
-		if (ROOT_RENDER_TRANSACTION !== null) journalBag();
-		el.textContent = text;
-	}
+	if (first !== null && first === el.lastChild && first.nodeType === 3 && first.nodeValue === text)
+		return;
+	if (ROOT_RENDER_TRANSACTION !== null) journalBag();
+	el.textContent = raw;
 }
 
 /**
  * React-compatible `dangerouslySetInnerHTML`. Hydration keeps an adopted
- * element's server content and records nothing (HydrationCapability.adoptHTML),
- * so the next render that passes an `__html` object rewrites it.
+ * element's server content (HydrationCapability.adoptHTML) and accepts it as
+ * the client's HTML, so only a changed string rewrites it, as in React 19.3.
  */
 export function setHTML(el: Element, value: any): void {
 	const next = value == null ? '' : String(value);
+	const html = typeof value === 'object' ? trustedOr(value, next) : next;
+	const host = el as any;
 	const hydration = hydrating ? CURSOR : null;
 	if (hydration !== null) {
-		hydration.adoptHTML(el, next);
+		hydration.adoptHTML(el, html);
+		journalRootProperty(el, DANGER_HTML_VALUE, host[DANGER_HTML_VALUE]);
+		host[DANGER_HTML_VALUE] = next;
 		return;
 	}
 	if (el.localName === 'script') {
-		setScriptText(el, next);
+		setScriptText(el, html);
 		return;
 	}
 	// Fresh wrappers must not replace identical children. Compare accepted authored
 	// HTML, including successful hydration adoption.
-	const host = el as any;
 	if (host[DANGER_HTML_VALUE] === next) return;
 	journalRootProperty(el, DANGER_HTML_VALUE, host[DANGER_HTML_VALUE]);
 	host[DANGER_HTML_VALUE] = next;
@@ -341,8 +347,8 @@ export function setHTML(el: Element, value: any): void {
 	const transaction = ROOT_RENDER_TRANSACTION === null ? null : pendingWrites(CURRENT_BLOCK);
 	if (transaction !== null) {
 		journalBag();
-		transaction.ops.push(commitHTML, [el, next]);
-	} else el.innerHTML = next;
+		transaction.ops.push(commitHTML, [el, html]);
+	} else el.innerHTML = html;
 }
 
 function commitHTML(write: [Element, string]): void {
@@ -804,8 +810,9 @@ export function setAttribute(el: Element, name: string, value: any): void {
 		}
 		return;
 	}
-	if (ns) el.setAttributeNS(ns, name, next);
-	else el.setAttribute(name, next);
+	const raw = typeof value === 'object' ? trustedOr(value, next) : next;
+	if (ns) el.setAttributeNS(ns, name, raw);
+	else el.setAttribute(name, raw);
 }
 
 // React's `warnedProperties` cache is module-global and keyed by prop name: once
@@ -904,7 +911,7 @@ export function setPlainAttribute(el: Element, name: string, value: unknown): vo
 	}
 	if (TRANSITION_JOURNAL !== null) journalBag();
 	if (next === null) el.removeAttribute(name);
-	else el.setAttribute(name, next);
+	else el.setAttribute(name, type === 'object' ? trustedOr(value as object, next) : next);
 }
 
 /** Same scalar contract for a statically proven, unnamespaced native URL sink. */
@@ -932,7 +939,7 @@ export function setURLAttribute(el: Element, name: string, value: unknown): void
 	}
 	if (TRANSITION_JOURNAL !== null) journalBag();
 	if (next === null) el.removeAttribute(name);
-	else el.setAttribute(name, next);
+	else el.setAttribute(name, type === 'object' ? trustedOr(value as object, next) : next);
 }
 
 /**
@@ -1234,9 +1241,8 @@ export function setClassName(el: Element, value: unknown, foreign?: boolean): vo
 	else (el as any).className = cls;
 }
 
-// Attribute-based class setter: SVG/MathML compiled TEMPLATE bindings (where
-// `className` is a read-only SVGAnimatedString so the fast `setClassName` can't be
-// used), and every runtime host's class (spreads, descriptors) route here.
+// Attribute-based class setter: SVG/MathML compiled template bindings (where
+// `className` is a read-only SVGAnimatedString) and direct class bindings.
 // clsx-composes the value; a nullish/false value REMOVES the attribute (parity with
 // the generic setAttribute this binding routed through before clsx composition
 // existed).
@@ -1888,6 +1894,42 @@ function skipSpreadKey(el: Element, k: string, flags: number): boolean {
 	);
 }
 
+// Reuse normalized strings without revisiting retained user objects or keeping them alive.
+const SPREAD_CLASS_VALUES = /* @__PURE__ */ new WeakMap<object, string | null>();
+
+function previousSpreadClass(value: unknown): string | null | undefined {
+	if (value == null || value === false) return null;
+	if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+		return normalizeClass(value);
+	if ((typeof value === 'object' && value !== null) || typeof value === 'function')
+		return SPREAD_CLASS_VALUES.get(value);
+	return undefined;
+}
+
+// Fresh host props can normalize to the class already on a spread's element.
+// Keep direct compiler class bindings on setClassAttr's write-only path.
+function setHostPropClassAttr(el: Element, value: unknown, prevValue: unknown): void {
+	const prevCls = previousSpreadClass(prevValue);
+	const cls = value == null || value === false ? null : normalizeClass(value);
+	if ((typeof value === 'object' && value !== null) || typeof value === 'function')
+		SPREAD_CLASS_VALUES.set(value, cls);
+	if (hydrating && CURSOR !== null) {
+		CURSOR.adopts(el);
+		if (process.env.NODE_ENV !== 'production') unpatchedClass(CURSOR, el, cls, false);
+		return;
+	}
+	if (TRANSITION_JOURNAL !== null) journalBag();
+	// Compare the DOM only when the authored class could already match. Changed
+	// values need a write, while a staged write must reassert its value at publish.
+	// Reuse the previous snapshot's normalized result; its class object may contain
+	// getters and must not be traversed again.
+	if (ROOT_RENDER_TRANSACTION === null || pendingWrites(CURRENT_BLOCK) === null) {
+		if (prevCls !== undefined && prevCls === cls && el.getAttribute('class') === cls) return;
+	}
+	if (cls === null) el.removeAttribute('class');
+	else el.setAttribute('class', cls);
+}
+
 // The one generic host-prop writer, for spreads and element descriptors: it
 // diffs `prev` → `value` (`prev` is undefined on mount) by identity, removing a
 // vanished prop through the removal that mirrors its setter. Bindings whose
@@ -2007,7 +2049,8 @@ export function setHostProps(
 			if (v === pv && !initialHydration) continue;
 			// Hydration-aware + SVG-safe class write (suppress/warn parity with a
 			// direct class binding); nullish/false removes the attribute.
-			setClassAttr(el, v);
+			if (descriptor) setClassAttr(el, v);
+			else setHostPropClassAttr(el, v, pv);
 			continue;
 		}
 		if (k === 'style') {
