@@ -19,6 +19,8 @@ import {
 	OptimisticForm,
 	BareOptimistic,
 	OptimisticCounter,
+	OptimisticSuspenseAction,
+	SuspendedTransitionRoot,
 	DirectAction,
 	ExposedDispatch,
 	RawForm,
@@ -34,6 +36,21 @@ function deferred<T = void>() {
 		reject = rej;
 	});
 	return { promise, resolve, reject };
+}
+
+function suspenseGate() {
+	const gate = deferred();
+	let ready = false;
+	return {
+		read: () => {
+			if (!ready) throw gate.promise;
+			return 'ready';
+		},
+		resolve: () => {
+			ready = true;
+			gate.resolve();
+		},
+	};
 }
 
 // Commit a microtask's worth of scheduled (transition-priority) work — used to
@@ -663,6 +680,84 @@ describe('useFormStatus', () => {
 });
 
 describe('useOptimistic', () => {
+	it('keeps optimistic state through a Suspense hold owned by its action', async () => {
+		const save = deferred();
+		const detail = suspenseGate();
+		const r = mount(OptimisticSuspenseAction, {
+			save: save.promise,
+			read: detail.read,
+			suspend: true,
+		});
+		try {
+			flushSync(() => (r.find('#save') as HTMLButtonElement).click());
+			await tick();
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+			flushSync(() => (r.find('#bare-add') as HTMLButtonElement).click());
+			await tick();
+			expect(r.find('#optimistic').textContent).toBe('1');
+
+			save.resolve();
+			await settle();
+			expect(r.find('#saved').textContent).toBe('0');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+			expect(r.find('#detail').textContent).toBe('old');
+
+			detail.resolve();
+			await settle();
+			expect(r.find('#saved').textContent).toBe('1');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('idle');
+			expect(r.find('#detail').textContent).toBe('ready');
+		} finally {
+			save.resolve();
+			detail.resolve();
+			await settle();
+			r.unmount();
+		}
+	});
+
+	it('reverts its optimistic state while an unrelated root stays suspended', async () => {
+		const save = deferred();
+		const detail = suspenseGate();
+		const unrelated = mount(SuspendedTransitionRoot, { read: detail.read });
+		const r = mount(OptimisticSuspenseAction, {
+			save: save.promise,
+			read: detail.read,
+			suspend: false,
+		});
+		try {
+			flushSync(() => (unrelated.find('#navigate') as HTMLButtonElement).click());
+			await settle();
+			expect(unrelated.find('#pending').textContent).toBe('pending');
+			expect(unrelated.find('#detail').textContent).toBe('old');
+
+			flushSync(() => (r.find('#save') as HTMLButtonElement).click());
+			await tick();
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+
+			save.resolve();
+			await settle();
+			expect(r.find('#saved').textContent).toBe('1');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('idle');
+			expect(unrelated.find('#pending').textContent).toBe('pending');
+
+			detail.resolve();
+			await settle();
+			expect(unrelated.find('#pending').textContent).toBe('idle');
+			expect(unrelated.find('#detail').textContent).toBe('ready');
+		} finally {
+			save.resolve();
+			detail.resolve();
+			await settle();
+			r.unmount();
+			unrelated.unmount();
+		}
+	});
+
 	it('shows the optimistic value during the action, then converges to real state', async () => {
 		const d = deferred();
 		const r = mount(OptimisticForm, { initial: ['x'], action: () => d.promise });
