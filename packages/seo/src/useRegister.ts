@@ -1,14 +1,17 @@
 /**
  * Register one component instance's descriptors with the enclosing registry.
  *
- * Render-time registration keeps SSR and hydration snapshots complete. Client
- * effects confirm each source after commit; the outlet reverts sources from a
- * caught render that never committed.
+ * Registration happens DURING RENDER, not in an effect: effects never run on the
+ * server, so an effect-based registration would leave the server-rendered
+ * `<head>` empty and hand crawlers nothing. That is precisely the failure this
+ * package exists to remove.
  *
- * The second effect removes the source on unmount. Document metadata does not
- * affect layout, so it does not need to block paint.
+ * A layout effect confirms the render's writes once it commits; the registry
+ * reverts writes from a render that never committed (a caught one) at the next
+ * flush. The passive effects notify the outlet and remove the source on
+ * unmount. Document metadata does not affect layout, so it does not block paint.
  */
-import { useContext, useEffect, useRef } from 'octane';
+import { useContext, useEffect, useLayoutEffect, useRef } from 'octane';
 import { SeoContext } from './context.js';
 import type { SeoConfig, SeoDescriptor } from './descriptors.js';
 import { commitSeoSource } from './registry.js';
@@ -25,7 +28,11 @@ export function useRegisterSeo(descriptors: readonly SeoDescriptor[], config?: S
 	registry.register(idRef.current, descriptors);
 	if (config !== undefined) registry.configure(idRef.current, config);
 
-	// Two effects, and they must stay separate.
+	// Runs before any passive flush in the same commit, so only writes from
+	// uncommitted renders are left pending when the registry flushes.
+	useLayoutEffect(() => commitSeoSource(registry, idRef.current), null);
+
+	// Two passive effects, and they must stay separate.
 	//
 	// Publish re-registers the committed descriptors and notifies the outlet. The
 	// dependency array is left to the compiler on purpose: `descriptors` is read

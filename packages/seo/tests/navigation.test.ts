@@ -122,6 +122,24 @@ describe('client navigation', () => {
 		expect(metaContent('robots')).toBeNull();
 	});
 
+	it('never publishes metadata from a caught render beside a committed update', () => {
+		click('to-failed');
+		const observer = new MutationObserver(() => {});
+		observer.observe(head(), { childList: true, subtree: true, attributes: true });
+
+		click('fail-local');
+
+		const robotsWrites = observer
+			.takeRecords()
+			.flatMap((record) => [record.target, ...record.addedNodes])
+			.filter((node) => node instanceof Element && node.getAttribute('name') === 'robots');
+		observer.disconnect();
+		expect(container.querySelector('#caught-local')?.textContent).toBe('caught');
+		expect(metaContent('description')).toBe('local failed');
+		expect(robotsWrites).toEqual([]);
+		expect(metaContent('robots')).toBeNull();
+	});
+
 	it('removes everything it owns when the app unmounts', () => {
 		root.unmount();
 		settle();

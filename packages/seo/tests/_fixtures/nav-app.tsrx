@@ -56,7 +56,22 @@ function FailingBody() {
 
 function FailedMetadata() @{
 	const [show, setShow] = useState(true);
+	const [local, setLocal] = useState(false);
 	<>
+		<Meta name="description" content={local ? 'local failed' : 'failed page'} />
+		@if (local) {
+			@try {
+				<>
+					<Meta name="robots" content="noindex" />
+					<FailingBody />
+				</>
+			} @catch {
+				<p id="caught-local">caught</p>
+			}
+		}
+		<button id="fail-local" onClick={() => setLocal(true)}>
+			fail without re-rendering Head
+		</button>
 		@if (show) {
 			@try {
 				<>

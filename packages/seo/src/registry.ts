@@ -35,21 +35,11 @@ export interface SeoRegistry {
 	flush(): void;
 }
 
-interface RegistryLifecycle {
-	commit(sourceId: number): void;
-	revertUncommitted(): void;
-}
+const registryCommits = new WeakMap<SeoRegistry, (sourceId: number) => void>();
 
-const registryLifecycles = new WeakMap<SeoRegistry, RegistryLifecycle>();
-
-/** @internal */
+/** @internal Confirm a source's render-time writes once its render commits. */
 export function commitSeoSource(registry: SeoRegistry, sourceId: number): void {
-	registryLifecycles.get(registry)?.commit(sourceId);
-}
-
-/** @internal */
-export function revertUncommittedSeoSources(registry: SeoRegistry): void {
-	registryLifecycles.get(registry)?.revertUncommitted();
+	registryCommits.get(registry)?.(sourceId);
 }
 
 function sameDescriptors(a: readonly SeoDescriptor[], b: readonly SeoDescriptor[]): boolean {
@@ -76,8 +66,10 @@ function sameConfig(a: SeoConfig, b: SeoConfig): boolean {
 export function createSeoRegistry(): SeoRegistry {
 	const sources = new Map<number, readonly SeoDescriptor[]>();
 	const configs = new Map<number, SeoConfig>();
-	// Render writes stay visible for SSR/hydration until client effects accept or
-	// revert them.
+	// Render writes stay visible for SSR/hydration until a layout effect confirms
+	// them. Every committed source is confirmed before any passive `flush()`, so
+	// whatever is still pending there came from a render that never committed
+	// (a caught or abandoned one) and is reverted before subscribers see it.
 	const pending = new Map<
 		number,
 		{ descriptors: readonly SeoDescriptor[] | undefined; config: SeoConfig | undefined }
@@ -167,11 +159,12 @@ export function createSeoRegistry(): SeoRegistry {
 			};
 		},
 		flush() {
+			revertUncommitted();
 			if (!dirty) return;
 			dirty = false;
 			for (const listener of listeners) listener();
 		},
 	};
-	registryLifecycles.set(registry, { commit, revertUncommitted });
+	registryCommits.set(registry, commit);
 	return registry;
 }
