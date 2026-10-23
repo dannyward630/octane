@@ -23,6 +23,7 @@ import {
 	transitionActionBatchForUpdate,
 	onTransitionBatchFinished,
 	markTransitionCue,
+	rootTransitionBatch,
 	startTransition,
 } from './transitions.js';
 import { CURSOR } from './hydration.js';
@@ -661,10 +662,12 @@ export function useFormStatus(slot?: HookSlot): FormStatus {
 // which case it is `state` folded through `updateFn(acc, value)` for each queued
 // addOptimistic call. Without an updateFn the fold is React's basicStateReducer:
 // a function value is an updater called with the pending state, as in useState,
-// and any other value replaces it. Urgent renders show every queued value. A
-// transition render that folds the owning batch's updates skips that batch's
-// values and drops them at commit, as React reverts them in the transition's
-// lane. A batch that finishes without such a render clears its values then, so
+// and any other value replaces it. A transition render that folds the owning
+// batch's updates skips that batch's values and drops them at commit, as React
+// reverts them in the transition's lane. Urgent renders show them, as React
+// renders optimistic values urgently, unless a timeout fallback lets the batch
+// commit while its hold stays open: an urgent render folding it then skips them
+// too. A batch that finishes without such a render clears its values then, so
 // later renders derive from the real state on success or revert to the
 // unchanged state on error.
 // addOptimistic should be called inside an Action.
@@ -802,15 +805,18 @@ export function useOptimistic<S, V = S>(
 	let optimistic = passthrough;
 	const reduce = updateFn ?? basicOptimisticReducer;
 	const queue = s.queue;
-	const owners = block.currentRenderMode === 'transition' ? s.owners : null;
+	const owners = s.owners;
+	const transition = block.currentRenderMode === 'transition';
 	let reverted: TransitionActionBatch[] | null = null;
 	for (let i = 0; i < queue.length; i++) {
 		const owner = owners === null ? null : owners[i];
-		// The owner's updates fold here exactly as in foldHookQueue.
+		// The owner's updates fold here exactly as in foldHookQueue. A ready batch
+		// with an open hold has only non-suspending (timeout fallback) holds left.
 		if (
 			owner !== null &&
 			TRANSITION_ROOT_DRIVER &&
-			TRANSITION_ROOT_DRIVER.fold(owner, true, ROOT_RENDER_TRANSACTION)
+			(transition || (rootTransitionBatch(owner).pendingHolds ?? 0) !== 0) &&
+			TRANSITION_ROOT_DRIVER.fold(owner, transition, ROOT_RENDER_TRANSACTION)
 		) {
 			if (reverted === null) reverted = [owner];
 			else if (reverted.indexOf(owner) === -1) reverted.push(owner);

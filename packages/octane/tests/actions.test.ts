@@ -765,52 +765,58 @@ describe('useOptimistic', () => {
 		}
 	});
 
-	it('reverts with the held work a timeout fallback lets commit', async () => {
-		vi.useFakeTimers({ shouldAdvanceTime: false });
-		const previousTimeout = getTransitionFallbackTimeout();
-		setTransitionFallbackTimeout(100);
-		const save = deferred();
-		const detail = suspenseGate();
-		const r = mount(OptimisticSuspenseAction, {
-			save: save.promise,
-			read: detail.read,
-			suspend: true,
-		});
-		try {
-			r.click('#save');
-			await act(async () => {
+	for (const urgentFirst of [false, true]) {
+		it(`reverts with the held work a timeout fallback lets commit (urgentFirst=${urgentFirst})`, async () => {
+			vi.useFakeTimers({ shouldAdvanceTime: false });
+			const previousTimeout = getTransitionFallbackTimeout();
+			setTransitionFallbackTimeout(100);
+			const save = deferred();
+			const detail = suspenseGate();
+			const r = mount(OptimisticSuspenseAction, {
+				save: save.promise,
+				read: detail.read,
+				suspend: true,
+			});
+			try {
+				r.click('#save');
+				await act(async () => {
+					save.resolve();
+					await save.promise;
+				});
+				expect(r.find('#saved').textContent).toBe('0');
+				expect(r.find('#optimistic').textContent).toBe('1');
+
+				if (urgentFirst) {
+					// An urgent render folds the released work before its retry task.
+					vi.advanceTimersByTime(100);
+				} else await act(() => vi.advanceTimersByTimeAsync(100));
+				expect(r.find('#fallback').textContent).toBe('loading');
+				expect(r.find('#pending').textContent).toBe('pending');
+
+				r.click('#bare-add');
+				expect(r.find('#saved').textContent).toBe('1');
+				expect(r.find('#optimistic').textContent).toBe('11');
+				await act(() => {});
+				expect(r.find('#saved').textContent).toBe('1');
+				expect(r.find('#optimistic').textContent).toBe('1');
+				expect(r.find('#pending').textContent).toBe('pending');
+
+				await act(async () => {
+					detail.resolve();
+				});
+				expect(r.find('#detail').textContent).toBe('ready');
+				expect(r.find('#optimistic').textContent).toBe('1');
+				expect(r.find('#pending').textContent).toBe('idle');
+			} finally {
 				save.resolve();
-				await save.promise;
-			});
-			expect(r.find('#saved').textContent).toBe('0');
-			expect(r.find('#optimistic').textContent).toBe('1');
-
-			await act(() => vi.advanceTimersByTimeAsync(100));
-			expect(r.find('#fallback').textContent).toBe('loading');
-			expect(r.find('#saved').textContent).toBe('1');
-			expect(r.find('#optimistic').textContent).toBe('1');
-			expect(r.find('#pending').textContent).toBe('pending');
-
-			r.click('#bare-add');
-			expect(r.find('#optimistic').textContent).toBe('11');
-			await act(() => {});
-			expect(r.find('#optimistic').textContent).toBe('1');
-
-			await act(async () => {
 				detail.resolve();
-			});
-			expect(r.find('#detail').textContent).toBe('ready');
-			expect(r.find('#optimistic').textContent).toBe('1');
-			expect(r.find('#pending').textContent).toBe('idle');
-		} finally {
-			save.resolve();
-			detail.resolve();
-			await act(() => {});
-			r.unmount();
-			setTransitionFallbackTimeout(previousTimeout);
-			vi.useRealTimers();
-		}
-	});
+				await act(() => {});
+				r.unmount();
+				setTransitionFallbackTimeout(previousTimeout);
+				vi.useRealTimers();
+			}
+		});
+	}
 
 	it('reverts without a cross-render warning when an urgent update supersedes its transition', async () => {
 		const fulfilled = (value: string) =>
