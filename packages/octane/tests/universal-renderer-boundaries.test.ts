@@ -43,6 +43,7 @@ import { StyledReverseScene } from './_fixtures/universal-styled-region.object.t
 import { ReverseOwnerDom } from './_fixtures/universal-reverse-owner.tsrx';
 import { OwnedCanvasApp } from './_fixtures/universal-owned-canvas-app.tsrx';
 import { getOwnedCanvasContainer } from './_fixtures/universal-owned-canvas.tsrx';
+import { loadCompiledFixtureSource } from './_server-fixture.js';
 import {
 	PreparedThenSiblingBoundaryApp,
 	ProjectedBoundaryApp,
@@ -60,6 +61,31 @@ function objectRoot() {
 	const container = createObjectContainer();
 	const root = createUniversalRoot(container, createObjectDriver());
 	return { container, root };
+}
+
+function compiledPendingBoundary(dev: boolean, id: string) {
+	return loadCompiledFixtureSource(
+		`import { use } from 'octane';
+export function Scene(props: { wait: Promise<string> }) @{
+	@try { const value = use(props.wait); <label value={value} /> }
+	@pending { <label value="pending" /> }
+}`,
+		{
+			id,
+			mode: 'client',
+			compileOptions: {
+				dev,
+				hmr: false,
+				renderer: {
+					id: 'object',
+					module: 'octane/universal',
+					target: 'universal',
+					text: 'host',
+				},
+			},
+			runtimeModules: { 'octane/universal': UniversalRuntime },
+		},
+	);
 }
 
 function controlledObjectRoot() {
@@ -648,6 +674,74 @@ describe('compiler-owned renderer child regions', () => {
 
 		mounted.unmount();
 		expect(container.children).toEqual([]);
+	});
+
+	it.each([
+		['development control', true, 'none'],
+		['production control', false, 'none'],
+		['development abort before settlement', true, 'before'],
+		['production abort before settlement', false, 'before'],
+		['development abort after settlement', true, 'after'],
+		['production abort after settlement', false, 'after'],
+	] as const)(
+		'keeps a committed pending boundary retry after a later attempt is aborted (%s)',
+		async (_case, dev, abortTiming) => {
+			const { container, root } = objectRoot();
+			let resolveWait!: (value: string) => void;
+			const wait = new Promise<string>((resolve) => {
+				resolveWait = resolve;
+			});
+			const { Scene } = compiledPendingBoundary(dev, '/src/universal-aborted-pending-replay.tsrx');
+
+			try {
+				root.render(Scene, { wait });
+				expect(container.children.map((child) => child.props.value)).toEqual(['pending']);
+
+				const prepared = abortTiming === 'none' ? null : root.prepare(Scene, { wait });
+				if (abortTiming === 'before') prepared!.abort();
+
+				resolveWait('ready');
+				await wait;
+				for (let index = 0; index < 20; index++) await Promise.resolve();
+				if (abortTiming === 'after') prepared!.abort();
+				for (let index = 0; index < 20; index++) await Promise.resolve();
+				expect(container.children.map((child) => child.props.value)).toEqual(['ready']);
+			} finally {
+				root.unmount();
+			}
+		},
+	);
+
+	it('restores a committed pending boundary retry when replacement host preparation throws', async () => {
+		const container = createObjectContainer();
+		const baseDriver = createObjectDriver();
+		let rejectPreparation = false;
+		const driver: ReturnType<typeof createObjectDriver> = {
+			...baseDriver,
+			prepareBatch(target, batch, context) {
+				if (rejectPreparation) throw new Error('replacement host preparation failed');
+				return baseDriver.prepareBatch(target, batch, context);
+			},
+		};
+		const root = createUniversalRoot(container, driver);
+		let resolveWait!: (value: string) => void;
+		const wait = new Promise<string>((resolve) => {
+			resolveWait = resolve;
+		});
+		const { Scene } = compiledPendingBoundary(false, '/src/universal-rejected-pending-replay.tsrx');
+
+		try {
+			root.render(Scene, { wait });
+			rejectPreparation = true;
+			expect(() => root.prepare(Scene, { wait })).toThrow('replacement host preparation failed');
+			rejectPreparation = false;
+			resolveWait('ready');
+			await wait;
+			for (let index = 0; index < 20; index++) await Promise.resolve();
+			expect(container.children.map((child) => child.props.value)).toEqual(['ready']);
+		} finally {
+			root.unmount();
+		}
 	});
 
 	it.each(['commit', 'unmount'] as const)(

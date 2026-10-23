@@ -1309,10 +1309,12 @@ interface SuspendedMemoReplay {
 	readonly entries: readonly SuspendedMemoEntry[];
 	readonly component: UniversalComponent<any>;
 	readonly props: any;
-	readonly transitionBatches: ReadonlySet<UniversalTransitionBatch>;
+	transitionBatches: ReadonlySet<UniversalTransitionBatch>;
 	readonly transitionRender: boolean;
 	active: boolean;
 	asyncWorkQueued: boolean;
+	// An inactive replay can still settle while a replacement attempt is prepared.
+	settled: boolean;
 }
 
 interface OwnerIdentityPathNode<T> {
@@ -1517,6 +1519,7 @@ function resumeOnSettle(wakeable: PromiseLike<unknown>, retry: () => void): void
 
 class UniversalSuspendedAttemptImpl implements UniversalSuspendedAttempt {
 	private state: 'suspended' | 'aborted' = 'suspended';
+	private abortRecovery: (() => void) | null = null;
 
 	constructor(
 		private readonly root: UniversalRootImpl<any, any>,
@@ -1535,6 +1538,10 @@ class UniversalSuspendedAttemptImpl implements UniversalSuspendedAttempt {
 		return this.state;
 	}
 
+	setAbortRecovery(recovery: () => void): void {
+		this.abortRecovery = recovery;
+	}
+
 	private settle(): void {
 		if (this.state !== 'suspended') return;
 		this.root.finishSuspension(this, true);
@@ -1543,7 +1550,13 @@ class UniversalSuspendedAttemptImpl implements UniversalSuspendedAttempt {
 	abort(preserveTransitions = false): void {
 		if (this.state !== 'suspended') return;
 		this.state = 'aborted';
-		this.root.finishSuspension(this, false, preserveTransitions);
+		try {
+			this.root.finishSuspension(this, false, preserveTransitions);
+		} finally {
+			const recovery = this.abortRecovery;
+			this.abortRecovery = null;
+			recovery?.();
+		}
 	}
 }
 
@@ -9072,8 +9085,16 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 		attempt: UniversalPreparedAttempt,
 		replay: SuspendedMemoReplay,
 	): void {
-		if (attempt.status !== 'aborted' || this.unmounted || this.unmounting) return;
-		if (this.queuedReplay !== null && this.queuedReplay !== replay && this.queuedReplay.active) {
+		if (attempt.status !== 'aborted') return;
+		this.restoreAbandonedReplay(replay);
+	}
+
+	private restoreAbandonedReplay(replay: SuspendedMemoReplay): void {
+		if (replay.active || this.unmounted || this.unmounting) return;
+		if (
+			(this.queuedReplay !== null && this.queuedReplay !== replay && this.queuedReplay.active) ||
+			(this.awaitingReplay !== null && this.awaitingReplay !== replay && this.awaitingReplay.active)
+		) {
 			return;
 		}
 		// Transaction.finish() requeues transition batches after a pre-ACK abort.
@@ -9092,20 +9113,24 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 				this.unattemptedTransitionBatches.delete(batch);
 			}
 		}
+		replay.transitionBatches = transitionBatches;
 		if (!this.scheduledUrgent) {
 			this.scheduled = false;
 			SCHEDULED_UNIVERSAL_ROOTS.delete(this);
 		}
-		const restored: SuspendedMemoReplay = {
-			entries: replay.entries,
-			component: replay.component,
-			props: replay.props,
-			transitionBatches,
-			transitionRender: replay.transitionRender,
-			active: true,
-			asyncWorkQueued: false,
-		};
-		this.queueReplay(restored);
+		replay.active = true;
+		replay.asyncWorkQueued = false;
+		if (replay.settled) this.queueReplay(replay);
+		else this.awaitingReplay = replay;
+	}
+
+	private preserveAbsorbedReplayOnAbort(
+		attempt: UniversalPreparedAttempt,
+		replay: SuspendedMemoReplay,
+	): void {
+		const restore = () => this.restoreAbandonedReplay(replay);
+		if (attempt instanceof UniversalTransactionImpl) attempt.setAbortRecovery(restore);
+		else if (attempt instanceof UniversalSuspendedAttemptImpl) attempt.setAbortRecovery(restore);
 	}
 
 	flushScheduledWork(): void {
@@ -9596,10 +9621,14 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 			transitionRender: false,
 			active: true,
 			asyncWorkQueued: false,
+			settled: false,
 		};
 		this.awaitingReplay = replay;
 		for (const thenable of thenables) {
-			resumeOnSettle(thenable, () => this.queueReplay(replay));
+			resumeOnSettle(thenable, () => {
+				replay.settled = true;
+				this.queueReplay(replay);
+			});
 		}
 	}
 
@@ -9667,6 +9696,7 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 			transitionRender: attempt.transitionRender,
 			active: true,
 			asyncWorkQueued: false,
+			settled: true,
 		});
 	}
 
@@ -10092,6 +10122,9 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 				!scheduledUrgent && scheduledTransitions.size !== 0,
 				absorbedReplay === null,
 			);
+			if (absorbedReplay !== null) {
+				this.preserveAbsorbedReplayOnAbort(attempt, absorbedReplay);
+			}
 			if (scheduledUrgent && attempt.status === 'suspended') {
 				this.ensureScheduledTransitionWork();
 			}
@@ -10104,6 +10137,7 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 			if (scheduledUrgent) {
 				this.finishTransitionBatches(this.takeScheduledTransitionBatches());
 			}
+			if (absorbedReplay !== null) this.restoreAbandonedReplay(absorbedReplay);
 			throw error;
 		}
 	}
@@ -13551,6 +13585,7 @@ class UniversalBoundHostTransaction<
 
 class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTransaction {
 	private state: 'prepared' | 'committed' | 'aborted' = 'prepared';
+	private abortRecovery: (() => void) | null = null;
 	private hostAccepted = false;
 	private commitStarted = false;
 	private completion: Promise<void> | null = null;
@@ -13580,6 +13615,16 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 		return this.state;
 	}
 
+	setAbortRecovery(recovery: () => void): void {
+		this.abortRecovery = recovery;
+	}
+
+	private runAbortRecovery(): void {
+		const recovery = this.abortRecovery;
+		this.abortRecovery = null;
+		recovery?.();
+	}
+
 	isAwaitingTransportAcknowledgement(): boolean {
 		return this.applyHostAsync !== null && this.commitStarted && !this.hostAccepted;
 	}
@@ -13591,6 +13636,7 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 		}
 		this.commitStarted = true;
 		this.hostAccepted = true;
+		this.abortRecovery = null;
 		runCommitTasks([
 			this.applyHost,
 			() => this.root.markBatchAccepted(this.batch.version),
@@ -13670,6 +13716,7 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 			}
 			this.root.validateTransportAcknowledgement(message, this.transportIdentity.version);
 			this.hostAccepted = true;
+			this.abortRecovery = null;
 			let hasError = false;
 			let firstError: unknown;
 			try {
@@ -13739,7 +13786,11 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 		try {
 			runCommitTasks([this.abortHost, this.onAbort]);
 		} finally {
-			this.root.finish(this);
+			try {
+				this.root.finish(this);
+			} finally {
+				this.runAbortRecovery();
+			}
 		}
 	}
 
@@ -13768,7 +13819,11 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 		try {
 			runCommitTasks([this.abortHost, this.onAbort]);
 		} finally {
-			this.root.finish(this);
+			try {
+				this.root.finish(this);
+			} finally {
+				this.runAbortRecovery();
+			}
 		}
 	}
 }
