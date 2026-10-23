@@ -120,6 +120,10 @@ function hasTextareaValueHandoff(node, namespace, hasChildren, isUnbound) {
 	);
 }
 
+function canConstructUnboundAttributeSpread(known) {
+	return known?.unbound === true && known.style !== 'object';
+}
+
 /** A scalar view can transfer its whole topology when only native textarea values are opaque. */
 export function canHandoffTextareaView(plan) {
 	if (
@@ -130,13 +134,18 @@ export function canHandoffTextareaView(plan) {
 		return false;
 	return plan.nodes.every(([, tag, namespace, children], index) => {
 		const element = plan.elements[index];
-		// A spread can override the control or introduce externally owned content.
-		if (
-			(element.openingElement?.attributes ?? element.attributes ?? []).some(
-				(attr) => attr.type === 'JSXSpreadAttribute' || attr.type === 'SpreadAttribute',
+		let hasSpread = false;
+		for (const attr of element.openingElement?.attributes ?? element.attributes ?? []) {
+			if (attr.type !== 'JSXSpreadAttribute' && attr.type !== 'SpreadAttribute') continue;
+			// A single verified renderer-owned spread cannot alter the control or its topology.
+			if (
+				tag !== 'textarea' ||
+				hasSpread ||
+				!canConstructUnboundAttributeSpread(attr._octaneKnownAttributeSpread)
 			)
-		)
-			return false;
+				return false;
+			hasSpread = true;
+		}
 		return (
 			children !== null ||
 			(tag === 'textarea' &&
@@ -235,7 +244,12 @@ export function planBindingProgram(fn, render, context) {
 			} else if (isChildSlot(node.expression)) {
 				next = { ...node, _octaneBindingSlot: metadata() };
 			} else if (helpers.isText(node.expression)) {
-				next = { ...node, _octaneBindingText: metadata() };
+				next = {
+					...node,
+					_octaneBindingText: context.fixedText?.has(node.expression)
+						? { fixed: true }
+						: metadata(),
+				};
 			} else if (canCarryValue(node.expression)) {
 				next = { ...node, _octaneBindingValue: metadata() };
 			}
@@ -881,6 +895,8 @@ export function planBindingProgram(fn, render, context) {
 			controls ||= native.bindings.some((binding) => binding[1] === 'control');
 			styles ||= native.styleIndices.length > 0;
 			const normalizedChildren = normalize(node.children ?? [], selfNs);
+			const fixedText =
+				normalizedChildren.length === 1 && normalizedChildren[0]._octaneBindingText?.fixed === true;
 			const opaqueChildren =
 				normalizedChildren.length > 0 &&
 				normalizedChildren.every((child) => child._octaneBindingOpaque);
@@ -901,6 +917,7 @@ export function planBindingProgram(fn, render, context) {
 				// The handoff validates the live text-only topology before accepting it.
 				nativeNode.push('value');
 			}
+			if (fixedText) nativeNode.push('text');
 			if (opaqueChildren)
 				constructionError ??=
 					'This view contains externally owned children that cannot be constructed by a binding program.';
@@ -934,7 +951,7 @@ export function planBindingProgram(fn, render, context) {
 					const known = attr._octaneKnownAttributeSpread;
 					// A verified provider names its exact fields, so a fresh node calls it
 					// once and applies each one. Adoption never evaluates these values.
-					if (known && known.style !== 'object') {
+					if (canConstructUnboundAttributeSpread(known)) {
 						const call = native.unbound.get(unwrap(attr.argument));
 						validate(call);
 						const provided = b.id(allocateProgramName('_bindingAttrs'));
@@ -1051,6 +1068,15 @@ export function planBindingProgram(fn, render, context) {
 					} else if (text.length > 0)
 						constructionError ??= 'This textarea has external children without an initial value.';
 				}
+			} else if (fixedText) {
+				const value = normalizedChildren[0].expression;
+				validate(value);
+				if (helpers.canCarryDirectSignalHandle(value)) {
+					signals = true;
+					signalIndices.push(bindings.length);
+				}
+				bindings.push([index, 'text', '#text']);
+				values.push(value);
 			} else if (nativeNode[4] !== null) {
 				for (const child of normalizedChildren)
 					appendTemplateIr(children, emit(child, index, selfNs, [...parents, tag]));

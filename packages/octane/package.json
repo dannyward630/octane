@@ -1,6 +1,6 @@
 {
   "name": "octane",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "license": "MIT",
   "type": "module",
   "sideEffects": [
@@ -101,8 +101,10 @@
     "./internal/client": "./src/internal/client.ts",
     "./internal/server": "./src/internal/server.ts",
     "./internal/context": "./src/internal/context.ts",
+    "./internal/universal-children": "./src/internal/universal-children.ts",
     "./internal/signal-read": "./src/internal/signal-read.ts",
     "./internal/hydration-signal": "./src/signals/hydration-input-source.ts",
+    "./internal/hydration-query": "./src/signals/hydration-query-input.ts",
     "./static": "./src/static/index.ts",
     "./testing": "./src/testing.ts",
     "./constants": "./src/constants.ts",
@@ -266,6 +268,11 @@
         "node": "./dist/node/signals/hydration-input-source.js",
         "default": "./dist/signals/hydration-input-source.js"
       },
+      "./internal/hydration-query": {
+        "types": "./dist/signals/hydration-query-input.d.ts",
+        "node": "./dist/node/signals/hydration-query-input.js",
+        "default": "./dist/signals/hydration-query-input.js"
+      },
       "./react/server": {
         "types": "./dist/react/server.d.ts",
         "node": "./dist/node/react/server.js",
@@ -336,6 +343,17 @@
         "import": "./dist/internal/server.js",
         "require": "./dist/cjs/internal/server.cjs",
         "default": "./dist/internal/server.js"
+      },
+      "./internal/universal-children": {
+        "types": "./dist/internal/universal-children.d.ts",
+        "node": {
+          "import": "./dist/node/internal/universal-children.js",
+          "require": "./dist/cjs/internal/universal-children.cjs",
+          "default": "./dist/node/internal/universal-children.js"
+        },
+        "import": "./dist/internal/universal-children.js",
+        "require": "./dist/cjs/internal/universal-children.cjs",
+        "default": "./dist/internal/universal-children.js"
       },
       "./internal/context": {
         "types": "./dist/internal/context.d.ts",

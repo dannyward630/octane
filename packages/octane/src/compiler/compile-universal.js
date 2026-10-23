@@ -8,11 +8,163 @@
  * to the selected renderer module.
  */
 import { builders as b, clone_ast_node, parseModule } from '@tsrx/core';
+import { createStyleScopePass } from './style-scopes.js';
 import { adoptTemplateShape } from './parser-template-shape.js';
 import { normalizeUniversalRuntime } from './universal-runtime.js';
 import { createContextSourceFacts } from './context-provider.js';
 import { inheritGeneratedOrigin } from './generated-origin.js';
 import { ARM_BREAK_MESSAGE, ARM_VALUE_RETURN_MESSAGE, armJump } from './arm-exits.js';
+
+// Keep CSS transformation in the DOM/SSR scope pass; only delivery is host-specific.
+const { applyStyleScopes } = createStyleScopePass({
+	inheritOriginLoc: inheritGeneratedOrigin,
+	markSynthesized: (node) => {
+		if (node != null) (node.metadata ??= {}).tsrx_synthesized_origin = true;
+		return node;
+	},
+	markSynthesizedAttr: (attr) => {
+		for (const node of [attr.name, attr.value]) {
+			if (node != null) (node.metadata ??= {}).tsrx_synthesized_origin = true;
+		}
+		return attr;
+	},
+	headResourceKind: () => null,
+	isCompositeJsxTag: (node) => {
+		const name = node.openingElement?.name;
+		return (
+			name?.type === 'JSXMemberExpression' ||
+			(name?.type === 'JSXIdentifier' && /^[A-Z]/.test(name.name))
+		);
+	},
+	isStyleCall: (node) =>
+		node?.type === 'CallExpression' &&
+		node.callee?.type === 'Identifier' &&
+		node.callee.name === 'style' &&
+		node.arguments.length === 1,
+});
+
+function scopeUniversalStyles(ast, state) {
+	if (!rendererHasCapability(state, 'scoped-styles')) return ast;
+	state.helpers.normalizeClass = allocName(
+		state,
+		`${state.planPrefix ?? '__octane'}NormalizeClass`,
+	);
+	const ctx = {
+		cssInjections: [],
+		runtimeNeeded: new Set(),
+		mode: 'client',
+		normalizeClassName: state.helpers.normalizeClass,
+	};
+	const body = ast.body.map((node) => applyStyleScopes(node, ctx).node);
+	if (ctx.runtimeNeeded.has('normalizeClass')) referenceHelper(state, 'normalizeClass');
+	state.styles = ctx.cssInjections.sort((a, b) => a.order - b.order);
+	return { ...ast, body };
+}
+
+// A captured class string does not transport the owner's CSS into another
+// renderer. Diagnose statically identifiable theme captures, including aliases,
+// while allowing themes declared inside the specialized unit itself.
+function validateRegionStyleCaptures(ast, authoredAst, state) {
+	if (!authoredAst || !rendererHasCapability(state, 'scoped-styles')) return;
+	const walk = (node, visit, parent = null, key = null) => {
+		if (!node || typeof node !== 'object') return;
+		visit(node, parent, key);
+		forEachRuntimeAstChild(node, (child, childKey) => walk(child, visit, node, childKey));
+	};
+	const includedStyles = new Set();
+	walk(ast, (node) => {
+		if (node.type === 'JSXStyleElement') includedStyles.add(node.start);
+	});
+	const lexical = createLexicalAnalysis(authoredAst);
+	const declarations = [];
+	const bindings = new Map();
+	walk(authoredAst, (node) => {
+		if (node.type !== 'VariableDeclarator' || !node.init) return;
+		const record = { init: node.init, external: false, users: [] };
+		declarations.push(record);
+		const names = new Set();
+		addPatternNames(node.id, names);
+		for (const name of names) {
+			const scope = lexical.resolveBinding(
+				lexical.nodeScopes.get(node.id) ?? lexical.rootScope,
+				name,
+			)?.scope;
+			if (!scope) continue;
+			if (!bindings.has(scope)) bindings.set(scope, new Map());
+			bindings.get(scope).set(name, record);
+		}
+	});
+	const bindingFor = (node) => {
+		const scope = lexical.resolveBinding(
+			lexical.nodeScopes.get(node) ?? lexical.rootScope,
+			node.name,
+		)?.scope;
+		return bindings.get(scope)?.get(node.name);
+	};
+	const queue = [];
+	for (const record of declarations) {
+		walk(record.init, (node) => {
+			if (node.type === 'JSXStyleElement' && !includedStyles.has(node.start))
+				record.external = true;
+		});
+		for (const capture of collectEntryCaptures(record.init, new Set())) {
+			for (const node of capture.nodes) bindingFor(node)?.users.push(record);
+		}
+		if (record.external) queue.push(record);
+	}
+	for (let index = 0; index < queue.length; index++) {
+		for (const user of queue[index].users) {
+			if (!user.external) {
+				user.external = true;
+				queue.push(user);
+			}
+		}
+	}
+	const externalReferences = new Map();
+	walk(authoredAst, (node, parent, key) => {
+		if (
+			node.type === 'Identifier' &&
+			isIdentifierReference(node, parent, key, lexical) &&
+			bindingFor(node)?.external
+		) {
+			externalReferences.set(node.start, node.name);
+		}
+	});
+	for (const capture of collectEntryCaptures(ast, new Set())) {
+		for (const node of capture.nodes) {
+			if (!externalReferences.has(node.start)) continue;
+			throw universalError(
+				state.filename,
+				node,
+				`theme ${JSON.stringify(externalReferences.get(node.start))} crosses a renderer boundary without its CSS; declare the theme inside the universal region or in a module compiled for that renderer.`,
+			);
+		}
+	}
+}
+
+// Register before HMR scaffolding: a throwing host must not install its cleanup.
+function universalStyleStatementsAst(state, origin) {
+	if (!state.styles?.length) return [];
+	state.helpers.styles = allocName(state, `${state.planPrefix ?? '__octane'}RegisterStyles`);
+	const call = generatedCall(
+		referenceHelper(state, 'styles'),
+		[
+			b.literal(`${state.filename}${state.planPrefix ? `#${state.planPrefix}` : ''}`),
+			b.array(
+				state.styles.map((sheet) =>
+					jsonValueToAst(
+						{ id: sheet.hash, css: sheet.css },
+						sheet.origins?.[0] ?? sheet.origin ?? origin,
+					),
+				),
+			),
+		],
+		origin,
+	);
+	if (!state.hmr) return [inheritGeneratedOrigin(b.stmt(call), origin)];
+	state.styleDisposal = allocName(state, `${state.planPrefix ?? '__octane'}DisposeStyles`);
+	return [generatedConst(state.styleDisposal, call, origin)];
+}
 
 // Keep this catalogue in the compiler, never in generated application code. It
 // is the union of actual constructor exports from Three r156, r172, and r183,
@@ -242,6 +394,8 @@ const THREE_BUILTIN_CONSTRUCTORS = new Set([
 
 const UNIVERSAL_RUNTIME_IMPORTS = new Set([
 	'Activity',
+	'Children',
+	'descriptorChildren',
 	'createContext',
 	'createPortal',
 	'lazy',
@@ -465,11 +619,24 @@ function isTemplateNode(node) {
 	);
 }
 
+function universalStyleError(node, state) {
+	return universalError(
+		state.filename,
+		node,
+		rendererHasCapability(state, 'scoped-styles')
+			? 'scoped-styles supports static raw CSS blocks, not browser <style> elements or stylesheet resources.'
+			: 'scoped <style> requires renderer capabilities: ["scoped-styles"] and a registerUniversalStyles export.',
+	);
+}
+
 function assertNoResidualTemplate(node, state, context) {
 	if (node == null || typeof node !== 'object') return;
 	if (Array.isArray(node)) {
 		for (const child of node) assertNoResidualTemplate(child, state, context);
 		return;
+	}
+	if (node.type === 'JSXStyleElement') {
+		throw universalStyleError(node, state);
 	}
 	if (
 		typeof node.type === 'string' &&
@@ -3157,6 +3324,13 @@ function registerThreeHostIntrinsic(type, node, state) {
 }
 
 function compileHostElementAst(node, context, state) {
+	if (
+		rendererHasCapability(state, 'scoped-styles') &&
+		node.openingElement?.name?.name === 'style'
+	) {
+		throw universalStyleError(node, state);
+	}
+
 	const type = jsxName(node);
 	if (type === 'Activity') return compileActivityElementAst(node, context, state);
 	if (isComponentElement(node)) return compileComponentElementAst(node, context, state);
@@ -3695,6 +3869,63 @@ function compileForAst(authored, context, state) {
 	const itemBinding = declaration.id;
 	const indexBinding =
 		node.index ?? generatedIdentifier(allocName(state, '__octaneUniversalIndex'), node);
+	let renderItemBinding = itemBinding;
+	let keyItemBinding = itemBinding;
+	let prepareItem = null;
+	if (itemBinding.type !== 'Identifier') {
+		if (node.key) {
+			// Loop bindings initialize before an authored key expression. Prepare
+			// one row so the key and body read the same extracted values.
+			const names = new Set();
+			addPatternNames(itemBinding, names);
+			const preparedPattern = () =>
+				inheritGeneratedOrigin(
+					b.array_pattern([...names].map((name) => generatedIdentifier(name, itemBinding))),
+					itemBinding,
+				);
+			renderItemBinding = preparedPattern();
+			if (collectEntryCaptures(node.key, new Set()).some(({ source }) => names.has(source))) {
+				keyItemBinding = preparedPattern();
+			} else {
+				keyItemBinding = generatedIdentifier(allocName(state, '__octaneUniversalRawItem'), node);
+			}
+			const rawItemBinding = generatedIdentifier(
+				allocName(state, '__octaneUniversalRawItem'),
+				node,
+			);
+			const preparedItemBinding = generatedIdentifier(
+				allocName(state, '__octaneUniversalPreparedItem'),
+				node,
+			);
+			const prepareBody = b.block([
+				inheritGeneratedOrigin(
+					b[authored.left.kind](rewriteSourceAst(itemBinding, state), rawItemBinding),
+					authored,
+				),
+				...[...names].map((name, index) =>
+					inheritGeneratedOrigin(
+						b.stmt(
+							b.assignment(
+								'=',
+								b.member(preparedItemBinding, b.literal(index), true),
+								generatedIdentifier(name, itemBinding),
+							),
+						),
+						itemBinding,
+					),
+				),
+				inheritGeneratedOrigin(b.return(preparedItemBinding), authored),
+			]);
+			prepareItem = generatedArrow(
+				[rawItemBinding, indexBinding, preparedItemBinding],
+				prepareBody,
+				node,
+			);
+		} else {
+			// A synthesized positional key needs no destructured binding.
+			keyItemBinding = generatedIdentifier(allocName(state, '__octaneUniversalRawItem'), node);
+		}
+	}
 	assertNoResidualTemplate(node.right, state, '@for source');
 	if (node.key) assertNoResidualTemplate(node.key, state, '@for key');
 	const host = !state.hmr ? ownerFreeForHost(node) : null;
@@ -3704,11 +3935,11 @@ function compileForAst(authored, context, state) {
 			? templateProgramForComponent(node, state)
 			: null;
 	const compactHost =
-		host === null ? null : compileOwnerFreeForHostAst(host, state, itemBinding, indexBinding);
+		host === null ? null : compileOwnerFreeForHostAst(host, state, renderItemBinding, indexBinding);
 	const compactComponent =
 		component === null
 			? null
-			: compileOwnerFreeThreeHostComponentAst(component, state, itemBinding, indexBinding);
+			: compileOwnerFreeThreeHostComponentAst(component, state, renderItemBinding, indexBinding);
 	const args = [
 		rewriteSourceAst(node.right, state),
 		// The universal runtime reconciles ranges by key only — there is no
@@ -3717,9 +3948,9 @@ function compileForAst(authored, context, state) {
 		// follows the slot rather than the item across reorders; `key item.id`
 		// remains the way to keep state attached to a moving item.
 		node.key
-			? generatedArrow([itemBinding, indexBinding], rewriteSourceAst(node.key, state), node.key)
+			? generatedArrow([keyItemBinding, indexBinding], rewriteSourceAst(node.key, state), node.key)
 			: generatedArrow(
-					[itemBinding, indexBinding],
+					[keyItemBinding, indexBinding],
 					generatedIdentifier(indexBinding.name, node),
 					node,
 				),
@@ -3730,13 +3961,13 @@ function compileForAst(authored, context, state) {
 				: compileTemplateProgramForComponentAst(
 						templateComponent,
 						state,
-						itemBinding,
+						renderItemBinding,
 						indexBinding,
 					)) ??
 			compileBlockValueAst(
 				node.body?.body ?? [],
 				state,
-				[itemBinding, indexBinding],
+				[renderItemBinding, indexBinding],
 				node.body ?? node,
 			),
 	];
@@ -3771,6 +4002,12 @@ function compileForAst(authored, context, state) {
 		args.push(b.literal(null, 'null'), b.literal(false), b.literal(false), b.literal(true));
 	} else if (node.empty) {
 		args.push(compileBlockValueAst(node.empty?.body ?? [], state, [], node.empty));
+	}
+	if (prepareItem !== null) {
+		while (args.length < 10) {
+			args.push(inheritGeneratedOrigin(b.unary('void', b.literal(0)), node));
+		}
+		args.push(prepareItem);
 	}
 	return addDynamicAst(context, generatedCall(referenceHelper(state, 'for'), args, node));
 }
@@ -3901,11 +4138,7 @@ function compileChildAst(node, context, state) {
 	if (node.type === 'JSXTryExpression') return [compileTryAst(node, context, state)];
 	if (node.type === 'JSXCodeBlock') return compileCodeBlockAst(node, [], context, state);
 	if (node.type === 'JSXStyleElement') {
-		throw universalError(
-			state.filename,
-			node,
-			'scoped <style> requires a renderer style/assets capability.',
-		);
+		throw universalStyleError(node, state);
 	}
 	if (node.type === 'JSXActivityExpression') {
 		throw universalError(state.filename, node, 'unsupported Activity expression shape.');
@@ -4169,6 +4402,8 @@ function threadHelperImportPairs(state) {
 // thread export just the helpers their renderer can emit, and bundlers reject
 // an import of a missing export even when nothing calls it.
 export const UNIVERSAL_RENDERER_HELPER_IMPORTS = Object.freeze([
+	['registerUniversalStyles', 'styles'],
+	['normalizeClass', 'normalizeClass'],
 	['defineUniversalComponent', 'component'],
 	['universalPlan', 'plan'],
 	['universalValue', 'value'],
@@ -4290,7 +4525,7 @@ function hmrComponentStore(root, origin) {
 }
 
 function hmrDisposalStatements(state, origin) {
-	return (state.threadFunctionDisposals ?? []).map((site) =>
+	const statements = (state.threadFunctionDisposals ?? []).map((site) =>
 		inheritGeneratedOrigin(
 			b.stmt(
 				generatedCall(
@@ -4302,6 +4537,10 @@ function hmrDisposalStatements(state, origin) {
 			origin,
 		),
 	);
+	if (state.styleDisposal) {
+		statements.unshift(inheritGeneratedOrigin(b.stmt(b.call(state.styleDisposal)), origin));
+	}
+	return statements;
 }
 
 function hmrHandoffStatements(state, hot, origin) {
@@ -4397,13 +4636,22 @@ function buildUniversalHmrBlocksAst(state, origin) {
 			...(ready === null ? [] : [b.if(b.id(ready), b.block([save]))]),
 			...disposals,
 		];
-		const disposeWith = (body) => b.stmt(b.call(b.member(hot, 'dispose'), b.arrow([data], body)));
+		const disposeWith = (body, method = 'dispose') =>
+			b.stmt(b.call(b.member(hot, method), b.arrow([data], body)));
 		// Vite runs only the last dispose handler a module registers, but the owner
-		// and each renderer region own thread functions. Each unit queues its
+		// and each renderer region own thread functions or styles. Each unit queues its
 		// cleanup on the persistent data and registers the same draining handler,
 		// so whichever registers last cleans up every unit.
 		const queue = (root) => b.member(root, '__octaneThreadDisposals');
 		const dispose = generatedIdentifier('dispose', origin);
+		const drain = () =>
+			b.block([
+				b.for_of(
+					b.const(dispose, null),
+					b.call(b.member(queue(data), 'splice'), b.literal(0)),
+					b.stmt(b.call(dispose)),
+				),
+			]);
 		prelude.push(
 			inheritGeneratedOrigin(
 				webpack
@@ -4420,15 +4668,10 @@ function buildUniversalHmrBlocksAst(state, origin) {
 										b.arrow([], b.block(disposals)),
 									),
 								),
-								disposeWith(
-									b.block([
-										b.for_of(
-											b.const(dispose, null),
-											b.call(b.member(queue(data), 'splice'), b.literal(0)),
-											b.stmt(b.call(dispose)),
-										),
-									]),
-								),
+								disposeWith(drain()),
+								...(state.styleDisposal
+									? [b.if(b.member(hot, 'prune'), disposeWith(drain(), 'prune'))]
+									: []),
 							]),
 						),
 				origin,
@@ -4503,8 +4746,8 @@ export function lowerUniversalRendererRegionAst(
 				);
 	const analysisEntryName = `${prefix}Source`;
 	const analysisEntry = generatedConst(analysisEntryName, regionExpression, origin);
-	const componentStatements = options.components ?? [];
-	const analysisAst = {
+	let componentStatements = options.components ?? [];
+	let analysisAst = {
 		type: 'Program',
 		sourceType: 'module',
 		body: [
@@ -4533,12 +4776,18 @@ export function lowerUniversalRendererRegionAst(
 		profileFilename: options.profileFilename,
 		helpers: {},
 		usedHelpers: new Set(),
-		componentNames: collectComponentNames(analysisAst),
-		contextSourceFacts: createContextSourceFacts(analysisAst),
+		componentNames: null,
+		contextSourceFacts: null,
 		runtimeImports: new Map(),
 		planPrefix: prefix,
 		validationImportReferences: [],
 	};
+	validateRegionStyleCaptures(analysisAst, options.authoredAst, state);
+	analysisAst = scopeUniversalStyles(analysisAst, state);
+	state.componentNames = collectComponentNames(analysisAst);
+	state.contextSourceFacts = createContextSourceFacts(analysisAst);
+	componentStatements = analysisAst.body.slice(runtimeImportAst === null ? 0 : 1, -1);
+	regionExpression = analysisAst.body.at(-1).declarations[0].init;
 	state.explicitThreeHostIntrinsics = collectExplicitThreeHostIntrinsics(
 		options.authoredAst ?? analysisAst,
 		renderer,
@@ -4744,6 +4993,7 @@ export function lowerUniversalRendererRegionAst(
 		origin,
 	);
 	specializationBindings.add(componentName);
+	const styleStatements = universalStyleStatementsAst(state, origin);
 	const hmrBlocks = buildUniversalHmrBlocksAst(state, origin);
 	const profileImport = universalProfileImportAst(state, origin);
 	const threeHostIntrinsics = threeHostIntrinsicStatementsAst(state, origin);
@@ -4786,6 +5036,7 @@ export function lowerUniversalRendererRegionAst(
 			}),
 			components: Object.freeze(state.components),
 			hmrComponents: Object.freeze(state.hmrComponents),
+			styles: state.styles ?? [],
 			bindings: Object.freeze([...specializationBindings]),
 			generatedRuntimeAliases,
 			renderer,
@@ -4797,6 +5048,7 @@ export function lowerUniversalRendererRegionAst(
 			...universalHelperImportAsts(state, helperImportPairs, origin),
 			...threeHostIntrinsics.imports,
 			...(profileImport === null ? [] : [profileImport]),
+			...styleStatements,
 			...hmrBlocks.prelude,
 			...threeHostIntrinsics.registrations,
 			...planDeclarations,
@@ -4835,7 +5087,7 @@ export function compileUniversal(
 		throw new TypeError('Octane universal compiler requires a resolved universal renderer.');
 	}
 	const universalRuntime = normalizeUniversalRuntime(options.universalRuntime);
-	const ast = parsedAst ?? adoptTemplateShape(parseModule(source, filename));
+	let ast = parsedAst ?? adoptTemplateShape(parseModule(source, filename));
 	const hmrDialect = options.hmr === true ? 'vite' : options.hmr || false;
 	const state = {
 		source,
@@ -4852,11 +5104,15 @@ export function compileUniversal(
 		profileFilename: options.profileFilename,
 		helpers: {},
 		usedHelpers: new Set(),
-		componentNames: collectComponentNames(ast),
-		contextSourceFacts: createContextSourceFacts(ast),
+		componentNames: null,
+		contextSourceFacts: null,
 		runtimeImports: new Map(),
 		ast,
 	};
+	ast = scopeUniversalStyles(ast, state);
+	state.ast = ast;
+	state.componentNames = collectComponentNames(ast);
+	state.contextSourceFacts = createContextSourceFacts(ast);
 	state.explicitThreeHostIntrinsics = collectExplicitThreeHostIntrinsics(ast, renderer);
 	state.ownerFreeThreeHostComponents = collectOwnerFreeThreeHostComponents(
 		ast,
@@ -4916,6 +5172,7 @@ export function compileUniversal(
 	}
 
 	const moduleOrigin = ast.body?.[0] ?? ast;
+	const styleStatements = universalStyleStatementsAst(state, moduleOrigin);
 	const hmrBlocks = buildUniversalHmrBlocksAst(state, moduleOrigin);
 	const metadata = {
 		componentHelper: state.helpers.component,
@@ -4933,6 +5190,7 @@ export function compileUniversal(
 		},
 		components: state.components,
 		hmrComponents: state.hmrComponents,
+		styles: state.styles ?? [],
 	};
 	const profileImport = universalProfileImportAst(state, moduleOrigin);
 	const threeHostIntrinsics = threeHostIntrinsicStatementsAst(state, moduleOrigin);
@@ -4943,6 +5201,7 @@ export function compileUniversal(
 			...universalHelperImportAsts(state, [], moduleOrigin),
 			...threeHostIntrinsics.imports,
 			...(profileImport === null ? [] : [profileImport]),
+			...styleStatements,
 			...hmrBlocks.prelude,
 			...threeHostIntrinsics.registrations,
 			...planDeclarations,

@@ -237,7 +237,6 @@ import {
 	clearFlushedTransitions,
 	scheduleTransitionBatch,
 	flushTransitionActionBatchIfReady,
-	TRANSITION_LISTENERS,
 	addTransitionHookToBatch,
 	publishTransitionHookBatch,
 	finishTransitionHookBatch,
@@ -330,6 +329,7 @@ import {
 	JOURNAL_EVENT_OWNER,
 	BAG_SIZE,
 	BAG_POOL,
+	commitQueuedBag,
 	queueFrontier,
 	noteFrontierMember,
 	queueRootDeletion,
@@ -729,8 +729,8 @@ let DEFERRED_SPAWN = false;
 /**
  * Outstanding transition WORK count — incremented when startTransition fires,
  * decremented when its renders commit (and again for any tryBlock that holds
- * the transition pending while suspended). Optimistic lifetimes subscribe to
- * this global count; useTransition tracks only its hook-owned Action batches.
+ * the transition pending while suspended). Devtools reports it; useTransition
+ * and useOptimistic track their own Action batches instead.
  */
 export let TRANSITION_PENDING_COUNT = 0;
 /**
@@ -803,12 +803,20 @@ export function unsuspendTransitionHolder(holder: object): void {
 			scheduleTransitionTask();
 		}
 }
-// useTransition/useOptimistic listeners are runtime-owned publication work.
-// When a transition boundary changes the pending count while another component
-// is rendering, their scheduled refreshes must not be diagnosed as userland
-// cross-component render updates. Keep this depth scoped to listener invocation;
-// startTransition's user callback runs only after tickTransitionCount returns.
-let TRANSITION_LISTENER_PUBLISH_DEPTH = 0;
+// Pending-state hook publications are runtime-owned render work. When a hook
+// publishes while another component is rendering, its scheduled refresh must
+// not be diagnosed as a userland cross-component render update.
+let TRANSITION_HOOK_PUBLISH_DEPTH = 0;
+
+/** Schedule a hook's urgent publication; its batch may finish while a boundary renders. */
+export function scheduleHookPublication(block: Block): void {
+	TRANSITION_HOOK_PUBLISH_DEPTH++;
+	try {
+		scheduleUrgentRender(block);
+	} finally {
+		TRANSITION_HOOK_PUBLISH_DEPTH--;
+	}
+}
 
 /** The scheduled Block drainQueue is rendering, while transitions are in use. */
 export let TRANSITION_ORIGIN: Block | null = null;
@@ -1177,6 +1185,12 @@ export function rollbackRootRender(transaction: RootRenderTransaction): void {
 			}
 			transaction.log.length = 0;
 		}
+		// Slot snapshots restore render state, but cannot restore a transition
+		// hold the parked reveal has already released outside the journal.
+		if (transaction.hostEventReveals !== undefined)
+			for (const reveal of transaction.hostEventReveals)
+				if (reveal.releasedHold && reveal.state.stagedCapture === reveal.capture)
+					reveal.state.transitionHeld = false;
 		// After the replay, which can restore a bag's queued state.
 		dropRootOps(transaction, 0, 0);
 		// A Block discarded with its parent has no creation entry
@@ -1257,6 +1271,68 @@ export function releaseRootLeases(owner: RootRenderOwner, root: Block | null): v
 	}
 }
 
+/** Publish a resumed arm's handlers before commit callbacks can observe it. */
+export function acceptHydrationHostEvents(transaction: RootRenderTransaction): boolean {
+	const hostEvents = transaction.capture.hostEvents!;
+	transaction.capture.hostEvents = undefined;
+	const owner = transaction.owner;
+	const previousOwner = COMMITTING_OWNER;
+	const previousGeneration = COMMITTING_GENERATION;
+	COMMITTING_OWNER = owner;
+	COMMITTING_GENERATION = owner.generation;
+	let failed: { recover: (error: unknown) => void; error: unknown } | undefined;
+	let stale: boolean;
+	try {
+		for (const install of hostEvents) {
+			if (owner.disposed || owner.generation !== COMMITTING_GENERATION) break;
+			try {
+				const undo = install();
+				// A later installer may revoke this acceptance. Undo belongs to this
+				// transaction even though no render frame is active here.
+				if (undo !== undefined) transaction.log.push(JOURNAL_UNDO, undo, null, null);
+			} catch (error) {
+				if (install.recover === undefined) throw error;
+				failed = { recover: install.recover, error };
+				break;
+			}
+		}
+		stale = owner.disposed || owner.generation !== COMMITTING_GENERATION;
+	} finally {
+		COMMITTING_OWNER = previousOwner;
+		COMMITTING_GENERATION = previousGeneration;
+	}
+	if (failed === undefined && !stale) return true;
+	if (!transaction.aborted) rollbackRootRender(transaction);
+	if (owner.transaction === transaction) owner.transaction = null;
+	if (!owner.disposed) {
+		if (stale) owner.retry();
+		else {
+			const recoveryGeneration = owner.generation;
+			failed!.recover(failed!.error);
+			// Recovering the failed arm does not recover unrelated root work.
+			// Its fallback may itself replace the root, superseding this retry.
+			if (!owner.disposed && owner.generation === recoveryGeneration) {
+				if (transaction.rootRequest) owner.retry();
+				else if (transaction.hostEventReveals !== undefined) {
+					// This transaction may have consumed a resolved parent's reveal.
+					// Its parked capture was transferred and discarded during rollback;
+					// render the recovered subtree again instead of replaying that capture.
+					for (const { state, capture } of transaction.hostEventReveals) {
+						if (owner.disposed || owner.generation !== recoveryGeneration) break;
+						if (
+							state.branch === 2 &&
+							state.stagedCapture === capture &&
+							state.pendingThenable === null
+						)
+							SCHEDULED_VISIBILITY_DRIVER!.reveal(state, 'urgent');
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
 /**
  * Commit every finished root render, in order. Each runs its queued commit ops
  * in render order (the mutation phase); a deletion cleanup that unmounts the
@@ -1312,6 +1388,12 @@ export function commitRootRenders(): void {
 					}
 					continue;
 				}
+				if (
+					hydrationStarted &&
+					transaction.capture.hostEvents !== undefined &&
+					!HYDRATION_DRIVER!.acceptHostEvents(transaction)
+				)
+					continue;
 				if (typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__)
 					__profileRootCommitted(transaction);
 				if (owner.transaction === transaction) owner.transaction = null;
@@ -1348,27 +1430,31 @@ export function commitRootRenders(): void {
 					try {
 						for (let i = 0; i < ops.length; i += 2) {
 							if (owner.disposed || owner.generation !== COMMITTING_GENERATION) break;
+							const op = ops[i];
 							const target = ops[i + 1];
+							const bag = op === commitQueuedBag;
 							COMMIT_OP = i;
 							try {
 								// A commit function's `careful` flag, as bagDone passes it.
-								ops[i](
-									target,
+								const careful =
 									TRANSITION_JOURNAL !== null ||
-										(_dispatchDepth !== 0 && CAPTURE_SLOTS.length !== 0),
-								);
+									(_dispatchDepth !== 0 && CAPTURE_SLOTS.length !== 0);
+								if (bag) {
+									// commitQueuedBag, inline.
+									const next = target.next;
+									next[(target.$ &= BAG_SIZE) + 2](target, next, careful);
+								} else op(target, careful);
 							} catch (error) {
 								// React routes a commit-phase error to the nearest boundary and keeps
 								// committing; the failed bag's state was cleared before its first write.
 								// A structural entry's cleanups already route their own errors.
-								if (typeof target?.$ !== 'number') throw error;
+								if (!bag) throw error;
 								if (SIGNAL_COMMIT_RETRY ? !SIGNAL_COMMIT_RETRY(target, error) : true)
 									reportEffectError(target.next[target.$ & BAG_SIZE].block, error);
 							}
 							// While the pool is short, an idle bag returns its cells and holds `C`
-							// again: a queued bag's entry always names its staged cells. Only a bag
-							// has `$`; any other target, null included, compares undefined.
-							if (BAG_POOL.length < 8 && target?.$ <= BAG_SIZE) {
+							// again: a queued bag's entry always names its staged cells.
+							if (bag && BAG_POOL.length < 8 && target.$ <= BAG_SIZE) {
 								const next = target.next;
 								BAG_POOL.push(next);
 								target.next = next[target.$ + 2];
@@ -1577,18 +1663,6 @@ export function tickTransitionCount(delta: number): void {
 	if (TRANSITION_PENDING_COUNT < 0) TRANSITION_PENDING_COUNT = 0;
 	if (typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__)
 		__devtoolsSetTransitionCount(TRANSITION_PENDING_COUNT);
-	TRANSITION_LISTENER_PUBLISH_DEPTH++;
-	try {
-		for (const fn of TRANSITION_LISTENERS) {
-			try {
-				fn();
-			} catch (err) {
-				console.error(err);
-			}
-		}
-	} finally {
-		TRANSITION_LISTENER_PUBLISH_DEPTH--;
-	}
 }
 // Commit actions that must run after the callback bodies above publish. Activity
 // uses this for visible→hidden deactivation+DOM hiding so its cleanup sees the
@@ -1898,7 +1972,7 @@ export function scheduleRender(
 	const renderPhaseOther =
 		CURRENT_BLOCK !== null &&
 		(!renderPhaseSelf || CURRENT_SCOPE !== block) &&
-		TRANSITION_LISTENER_PUBLISH_DEPTH === 0 &&
+		TRANSITION_HOOK_PUBLISH_DEPTH === 0 &&
 		EFFECT_EVENT_LIFECYCLE_DEPTH === 0;
 	if (renderPhaseOther) {
 		block.crossRenderUpdate = true;
@@ -4929,7 +5003,7 @@ export function useTransition(
 				hook.tentative = false;
 				if (hook.isPending === pending || block.disposed) return;
 				hook.isPending = pending;
-				TRANSITION_LISTENER_PUBLISH_DEPTH++;
+				TRANSITION_HOOK_PUBLISH_DEPTH++;
 				try {
 					if (typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__)
 						__profileSchedule(block, 'transition-pending', slot);
@@ -4937,7 +5011,7 @@ export function useTransition(
 					if (pending) markTransitionCue(block);
 					scheduleRender(block, false, pending);
 				} finally {
-					TRANSITION_LISTENER_PUBLISH_DEPTH--;
+					TRANSITION_HOOK_PUBLISH_DEPTH--;
 				}
 			},
 		};
@@ -4998,19 +5072,38 @@ export function runDeferredSwaps(): void {
 	// Every swap schedules its render here, so they all join the one flush
 	// that ends this task rather than posting another.
 	TRANSITION_TASK_ACTIVE = true;
+	let roots: RootRenderOwner[] | null = null;
 	try {
-		for (let i = 0; i < slots.length; i++) swapDeferredValue(slots[i]);
+		for (let i = 0; i < slots.length; i++) {
+			const root = swapDeferredValue(slots[i]);
+			if (root !== null && !(roots ??= []).includes(root)) roots.push(root);
+		}
+		// One deferred attempt per held root. A second would roll back the first,
+		// and its suspension would stop watching the attempt that spawned both.
+		if (roots !== null) for (const root of roots) root.retry(true);
 	} finally {
 		TRANSITION_TASK_ACTIVE = false;
 	}
 }
 
-function swapDeferredValue<T>(s: DeferredSlot<T>): void {
-	// A slot that unmounted, or whose spawning render was rolled back, since
-	// the spawn has nothing to swap. A duplicate entry finds `scheduled` clear.
-	if (!s.scheduled || s.block.disposed) return;
+/** Swap `s`, or return the held root its rolled-back render left to retry deferred. */
+function swapDeferredValue<T>(s: DeferredSlot<T>): RootRenderOwner | null {
+	// A duplicate entry finds `scheduled` clear.
+	if (!s.scheduled) return null;
 	s.scheduled = false;
-	if (Object.is(s.value, s.next)) return;
+	if (s.block.disposed) {
+		// The slot unmounted, or its spawning render was rolled back. A root still
+		// waiting for its first commit renders the final value as another attempt,
+		// as React renders the deferred lane the suspended render spawned. Either
+		// attempt commits once it is ready (suspendRootRender).
+		const owner = s.block.idState.renderOwner;
+		return owner !== undefined &&
+			owner.wakeable !== null &&
+			(owner.current === null || owner.current.disposed)
+			? owner
+			: null;
+	}
+	if (Object.is(s.value, s.next)) return null;
 	// Set the flag INSIDE the callback so it wraps only the scheduleRender
 	// for the deferred block: startTransition synchronously notifies
 	// useTransition listeners (tickTransitionCount) BEFORE running fn, and
@@ -5032,6 +5125,7 @@ function swapDeferredValue<T>(s: DeferredSlot<T>): void {
 			DEFERRED_SPAWN = false;
 		}
 	});
+	return null;
 }
 
 /** Disconnect the committed identities, including refs replaced by this render. */
@@ -5128,6 +5222,7 @@ export function makeRoot(
 		props: any,
 		nextKey: any,
 		mode?: 'urgent' | 'transition',
+		deferred = false,
 	): void => {
 		if (unmounted) return;
 		// Root render entry can carry contexts bumped outside provideContext —
@@ -5294,6 +5389,7 @@ export function makeRoot(
 			}
 			const mountedRoot = rootBlock;
 			mountedRoot.pendingMode = mode ?? null;
+			mountedRoot.pendingDeferred = deferred;
 			try {
 				renderBlock(mountedRoot);
 				// Mount-time self-updates are part of this first commit. Replay before
@@ -5454,7 +5550,8 @@ export function makeRoot(
 			renderOwner.retryKey = null;
 			renderOwner.request = null;
 			if (renderOwner.transaction?.aborted === true) renderOwner.transaction = null;
-			renderOwner.retry = () => renderResolved(body, props, nextKey);
+			renderOwner.retry = (deferred) =>
+				renderResolved(body, props, nextKey, deferred ? 'transition' : undefined, deferred);
 			renderResolved(body, props, nextKey);
 		},
 		unmount() {

@@ -22,12 +22,42 @@ const repositoryRoot = resolve(packageDirectory, '../..');
 
 const PLAIN_SOURCE = `export function App() @{ <view id="simple" /> }`;
 
+const KEYED_DESTRUCTURED_FOR_SOURCE = `
+	export function App() @{
+		const rows = [['A'].values(), ['B'].values()];
+		@for (const [name] of rows; key name) {
+			<view><text>{name as string}</text></view>
+		}
+	}
+`;
+
+const KEYED_DESTRUCTURED_OBJECT_FOR_SOURCE = `
+	export function App() @{
+		const rows = [{ name: 'A' }, { name: 'B' }];
+		@for (const { name } of rows; key name) {
+			<view><text>{name as string}</text></view>
+		}
+	}
+`;
+
 const SETUP_BLOCK_SOURCE = `
 	export function App(props) @{
 		<view>@{
 			const value = props.label;
 			<text>{value as string}</text>
 		}</view>
+	}
+`;
+
+const CHILDREN_MAP_SOURCE = `
+	import { Children } from 'octane';
+
+	function Wrap(props) @{
+		<view>{Children.map(props.children, (child) => <view>{child}</view>)}</view>
+	}
+
+	export function App() @{
+		<Wrap><text>{'A'}</text><text>{'B'}</text></Wrap>
 	}
 `;
 
@@ -92,7 +122,10 @@ process.stdout.write(JSON.stringify({
 			encoding: 'utf8',
 			input: JSON.stringify({
 				plain: PLAIN_SOURCE,
+				keyedDestructuredFor: KEYED_DESTRUCTURED_FOR_SOURCE,
+				keyedDestructuredObjectFor: KEYED_DESTRUCTURED_OBJECT_FOR_SOURCE,
 				setupBlock: SETUP_BLOCK_SOURCE,
+				childrenMap: CHILDREN_MAP_SOURCE,
 				statefulBlock: STATEFUL_BLOCK_SOURCE,
 			}),
 		},
@@ -133,6 +166,12 @@ function compilerRuntimeImports(renderer: UniversalRendererConfig): Map<string, 
 		if (
 			name === 'firstScreenEvent' &&
 			!renderer.capabilities?.includes('main-thread-render-only')
+		) {
+			continue;
+		}
+		if (
+			(name === 'registerUniversalStyles' || name === 'normalizeClass') &&
+			!renderer.capabilities?.includes('scoped-styles')
 		) {
 			continue;
 		}
@@ -250,6 +289,36 @@ describe('Lynx compiled output links against its renderer runtime', () => {
 				{ op: 'insert', parent: null, id: 1, before: null },
 			],
 		});
+	});
+
+	it.each([
+		['keyedDestructuredFor', 'iterator'],
+		['keyedDestructuredObjectFor', 'object'],
+	])('prepares keyed destructured %s rows on the Lynx first screen (%s)', async (program) => {
+		const main = await renderMainThread(program, {});
+		const background = await renderBackground(program, {});
+
+		for (const value of ['A', 'B']) {
+			expect(main.commands).toContainEqual(
+				expect.objectContaining({ op: 'create', type: '#text', props: { value } }),
+			);
+		}
+		expect(main).toEqual(background);
+	});
+
+	it('maps Children on the first screen identically on both threads', async () => {
+		const main = await renderMainThread('childrenMap', {});
+		const background = await renderBackground('childrenMap', {});
+
+		for (const value of ['A', 'B']) {
+			expect(main.commands).toContainEqual(
+				expect.objectContaining({ op: 'create', type: '#text', props: { value } }),
+			);
+		}
+		expect(
+			main.commands.filter((command: { op: string; type?: string }) => command.type === 'view'),
+		).toHaveLength(3);
+		expect(main).toEqual(background);
 	});
 
 	it('bundles and renders a setup-bearing child block on the main thread', async () => {

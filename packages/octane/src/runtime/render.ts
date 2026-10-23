@@ -15,6 +15,7 @@ import {
 	discardServerArm,
 	setTryBranch,
 	restartUncommittedTry,
+	type InitialHydrationQueryCapture,
 	type InitialSuspenseHydration,
 	initialSuspenseHydrations,
 	retireInitialSuspenseHydration,
@@ -49,6 +50,7 @@ import {
 	handleResumeError,
 } from './suspense.js';
 import { hydrating } from '../hydration-flag.js';
+import { INITIAL_ADOPTION_INPUT_CHANGED } from '../hydration-input-control.js';
 import { renderSlice, type RenderSlice } from '../render-slice.js';
 import { EPOCH_CELL } from '../context-epoch.js';
 import { STREAM_BOUNDARY_ATTR } from '../constants.js';
@@ -87,6 +89,7 @@ import type {
 	TransitionActionBatch,
 	RootRenderOwner,
 	RootRenderTransaction,
+	HydrationEventReveal,
 	Phase,
 	SuspenseRefEntry,
 	OffscreenCapture,
@@ -112,6 +115,7 @@ import {
 	signalRetryBoundary,
 	retainSignalRetryScope,
 	clearSignalRetryOwners,
+	supersedeSignalRetryOwners,
 	type SignalRetryVisit,
 	takeSignalRetryVisit,
 	pruneSignalRetryVisit,
@@ -189,6 +193,7 @@ import {
 	releaseDiagnostics,
 	claimDeferred,
 	hydrationFailure,
+	hydrationHostFailure,
 	settleTexts,
 	parseSeedJson,
 	isBlockClose,
@@ -511,6 +516,10 @@ export function suspendRootRender(block: Block, wakeable: PromiseLike<unknown>):
 	if (owner === undefined || owner.disposed) return false;
 	const transaction = owner.transaction;
 	if (transaction === null) return false;
+	// A deferred pass does not supersede the attempt that spawned it: whichever
+	// of their wakeables settles first retries the root. Read it before the
+	// rollback, whose disposal of the root's Block clears it.
+	const spawning = block.currentRenderDeferred ? owner.wakeable : null;
 	// A transition render holds its batches at the root; the origin's end drops it.
 	if (block.currentRenderMode === 'transition' && transaction.batches !== null)
 		(transaction.holders ??= []).push(owner);
@@ -550,6 +559,7 @@ export function suspendRootRender(block: Block, wakeable: PromiseLike<unknown>):
 		});
 	};
 	resumeOnSettle(wakeable, ping);
+	if (spawning !== null && spawning !== wakeable) resumeOnSettle(spawning, ping);
 	return true;
 }
 
@@ -792,7 +802,7 @@ export function renderBlockInner(block: Block): true | undefined {
 	(block as any).__thenableDone = false;
 	// Clear last render's recorded context dependencies; this render repopulates
 	// them (its own reads + descendant reads propagated up). Only memo/armed
-	// blocks ever hold a non-null map, so this is a no-op for the common case.
+	// blocks hold dependency collections; the common case has nothing to clear.
 	if (block.$$ctxReads !== null) block.$$ctxReads.clear();
 	if (block.$$ctxDirect !== null) {
 		// Native refreshes retain Hydrate props. Save context invalidation before
@@ -806,9 +816,9 @@ export function renderBlockInner(block: Block): true | undefined {
 		) {
 			state.contextChanged = block.$$ctxDepsEpoch !== EPOCH_CELL.value && ctxDirectChanged(block);
 		}
-		block.$$ctxDirect.clear();
+		block.$$ctxDirect = null;
 	}
-	// Stamp the dep maps' consistency epoch: entries written during this render
+	// Stamp the dependencies' consistency epoch: entries written during this render
 	// record live versions, so while the global epoch still equals this sample
 	// no recorded dep can be stale. Sampling at the TOP is deliberate — a
 	// provider commit mid-render advances the epoch past this stamp, so the
@@ -1835,11 +1845,43 @@ export function renderVisibleTry(state: TrySlot, source?: Block): void {
 	}
 }
 
+function acceptInitialHydrationQuery(
+	state: TrySlot,
+	initial: InitialSuspenseHydration,
+	query: NonNullable<InitialSuspenseHydration['query']>,
+): void {
+	if (
+		query.refined ||
+		initial.query !== query ||
+		state.pendingThenable !== query.waiting ||
+		initialSuspenseHydrations?.get(state) !== initial
+	)
+		return;
+	journalRootProperty(query, 'refined', undefined);
+	query.refined = true;
+}
+
 export function renderInitialSuspenseHydration(
 	state: TrySlot,
 	initial: InitialSuspenseHydration,
 	updated = false,
+	queryCapture?: InitialHydrationQueryCapture,
+	refineQuery?: InitialSuspenseHydration['query'],
 ): void {
+	if (refineQuery !== undefined) {
+		if (!refineQuery.refined) {
+			if (WIP_CAPTURE === null) acceptInitialHydrationQuery(state, initial, refineQuery);
+			else
+				(WIP_CAPTURE.renderCleanups ??= []).push((discarded) => {
+					if (!discarded) acceptInitialHydrationQuery(state, initial, refineQuery);
+				});
+		}
+		// Preserve the original wake, which retries with the latest committed environment.
+		if (HYDRATION_PASS !== null) HYDRATION_PASS.node = getNextSibling(state.end);
+		return;
+	}
+	if (state.pendingThenable !== null && ROOT_RENDER_TRANSACTION?.rootRequest === true)
+		journalObjectOnce(state);
 	state.pendingThenable = null;
 	if (updated) {
 		// New inputs reached the arm while its hydration was suspended, or its
@@ -1858,11 +1900,14 @@ export function renderInitialSuspenseHydration(
 		return;
 	}
 	if (initial.waits !== undefined) {
+		queryCapture ??= initial.queryCapture;
+		if (queryCapture !== undefined) initial.queryCapture = queryCapture;
 		const taken = waitForStreamedArm(state, initial);
 		if (taken === null) return;
 		initial = taken;
 	}
 	state.idState.next = initial.idStart;
+	const firstAttempt = state.branch === -1;
 	const block = TRY_OPS!.createBody(state, initial.start, initial.end);
 	state.block = block;
 	TRY_OPS!.setBranch(state, 1);
@@ -1878,6 +1923,9 @@ export function renderInitialSuspenseHydration(
 	const capture = createOffscreenCapture();
 	// What the attempt queued for its root's commit goes with a discarded one.
 	const transaction = ROOT_RENDER_TRANSACTION;
+	if (transaction !== null && previousCapture !== null)
+		hydration.recoverHostEvent = (error) =>
+			TRY_OPS!.inBoundary(state, recoverHydrationEvent, error);
 	const opsMark = transaction === null ? 0 : transaction.ops.length;
 	const retiredMark = transaction?.retired?.size ?? 0;
 	swapHydration(hydration);
@@ -1885,6 +1933,7 @@ export function renderInitialSuspenseHydration(
 	const previousNative = setNativeAdoptionResolver(null);
 	const diagnostics = holdDiagnostics();
 	let suspended: TrackedThenable<unknown> | null = null;
+	let finishQuery: ReturnType<InitialHydrationQueryCapture> = undefined;
 	let failed = false;
 	let failure: unknown;
 	try {
@@ -1892,6 +1941,7 @@ export function renderInitialSuspenseHydration(
 			hydration.nativeAdoption = ownNativeAdoption(block, initial.nativeRaw);
 			setNativeAdoptionResolver(hydration.nativeAdoption.resolve);
 		}
+		finishQuery = firstAttempt && state.env !== undefined ? queryCapture?.(state.env) : undefined;
 		renderBlock(block);
 		if (hydration.deferred !== null) claimDeferred(hydration);
 		drainHydrationRenderPhaseUpdates(block, true);
@@ -1901,7 +1951,14 @@ export function renderInitialSuspenseHydration(
 	} catch (error) {
 		failed = true;
 		failure = hydrationFailure(hydration, error);
-		if (isSuspenseException(error)) suspended = error.thenable;
+		const finish = finishQuery;
+		finishQuery = undefined;
+		if (isSuspenseException(error)) {
+			suspended = error.thenable;
+			// Finish the exact authored read before disposing this attempt can release its owner.
+			const retains = finish?.(suspended);
+			if (retains !== undefined) initial.query = { waiting: suspended, retains };
+		} else finish?.();
 		// The next attempt finds the server arm as the server rendered it.
 		if (typeof __OCTANE_PROFILE_ENABLED__ !== 'undefined' && __OCTANE_PROFILE_ENABLED__)
 			__profileCount(ProfileCounter.ROLLBACK_HYDRATION);
@@ -1924,7 +1981,8 @@ export function renderInitialSuspenseHydration(
 				if (!created.disposed && blockIsAncestorOf(block, created))
 					retainSignalRetryScope(created, block, state);
 			RETAINED_SIGNAL_OWNERS = state.retrySignalOwners;
-		} else if (state.retrySignalOwners !== undefined) clearSignalRetryOwners(state);
+		} else if (failure === INITIAL_ADOPTION_INPUT_CHANGED) supersedeSignalRetryOwners(state);
+		else if (state.retrySignalOwners !== undefined) clearSignalRetryOwners(state);
 		try {
 			withRefDetachSuppression(refs, () => unmountBlock(block, false));
 		} finally {
@@ -1934,6 +1992,7 @@ export function renderInitialSuspenseHydration(
 		state.tryBlock = null;
 		discardOffscreenCapture(capture);
 	} finally {
+		finishQuery?.();
 		// The attempt that commits, or the catch arm that replaces this one,
 		// reports what it finds. An attempt that found a mismatch is final: the
 		// arm renders on the client, and its diagnostics describe why.
@@ -1941,7 +2000,12 @@ export function renderInitialSuspenseHydration(
 		// The arm's client render reads client data, and a retry seeds afresh.
 		// Seeds an attempt that a catch arm replaces settled stay with the
 		// enclosing hydration, whose own fallback discards them.
-		if (failure instanceof HydrationMismatch || suspended !== null) discardSeeds(hydration);
+		if (
+			failure instanceof HydrationMismatch ||
+			failure === INITIAL_ADOPTION_INPUT_CHANGED ||
+			suspended !== null
+		)
+			discardSeeds(hydration);
 		else if (failed) passSeeds(hydration, previousHydration);
 		setNativeAdoptionResolver(previousNative);
 		WIP_CAPTURE = previousCapture;
@@ -1951,7 +2015,10 @@ export function renderInitialSuspenseHydration(
 	}
 	if (!failed) {
 		if (state.retrySignalOwners !== undefined) clearSignalRetryOwners(state);
-		retireInitialSuspenseHydration(state);
+		retireInitialSuspenseHydration(
+			state,
+			capture.hostEvents !== undefined && transaction?.rootRequest === true ? initial : undefined,
+		);
 		// An enclosing boundary may still suspend after this arm rendered. Leave
 		// its server metadata and ranges replayable until that capture commits.
 		(capture.renderCleanups ??= []).push((discarded) => {
@@ -1972,6 +2039,14 @@ export function renderInitialSuspenseHydration(
 				return;
 			TRY_OPS!.inBoundary(state, retryInitialSuspenseHydration, initial);
 		});
+		return;
+	}
+	if (failure === INITIAL_ADOPTION_INPUT_CHANGED) {
+		// The comparator accepted before the arm could observe this input. A
+		// reentrant change invalidated it at the actual read, so use the same
+		// silent client fallback as inputs changed before the attempt began.
+		markArmDiscard(state);
+		clientRenderDehydratedTry(state, previousHydration);
 		return;
 	}
 	retireInitialSuspenseHydration(state);
@@ -2000,6 +2075,13 @@ export function renderInitialSuspenseHydration(
 	}
 }
 
+function recoverHydrationEvent(state: TrySlot, error: unknown): void {
+	const failure = hydrationHostFailure(error);
+	markArmDiscard(state);
+	if (!clientRenderDehydratedTry(state, null))
+		noteRecoverableHydrationError(() => failure, state.parentBlock);
+}
+
 export function commitResumeInner(state: TrySlot): void {
 	if (state.parentBlock.disposed) return;
 	let deferredNativeAcceptance = false;
@@ -2026,10 +2108,24 @@ export function commitResumeInner(state: TrySlot): void {
 		if (WIP_CAPTURE === null)
 			deferredNativeAcceptance = acceptNativeCapture(staged, state.parentBlock.idState.renderOwner);
 	}
+	const stagedCapture = state.stagedCapture;
+	const transaction = ROOT_RENDER_TRANSACTION;
+	if (
+		stagedCapture?.hostEvents !== undefined &&
+		transaction !== null &&
+		!transaction.aborted &&
+		!ROOT_RENDER_ROLLBACK &&
+		transaction.owner === state.parentBlock.idState.renderOwner
+	) {
+		// A sibling can release this reveal inside its root render. Preserve the
+		// parked owner and its actions until the transferred host events are accepted.
+		journalRootReveal(state);
+	}
 	const wasPending = state.branch === 2;
 	const hiddenActivity = findHiddenActivity(state.parentBlock);
 	const wasHeld = state.transitionHeld;
 	let releaseHeld = wasHeld;
+	let eventReveal: HydrationEventReveal | undefined;
 	if (wasHeld) state.transitionHeld = false;
 	// Leave the coordination sets — this boundary is committing now (a re-suspend
 	// during the re-render re-adds it via handleSuspense → enterHeldTransition).
@@ -2039,7 +2135,6 @@ export function commitResumeInner(state: TrySlot): void {
 		const tryBlock = state.tryBlock;
 		if (tryBlock && !tryBlock.disposed) {
 			const reconnectEffects = state.hiddenDom !== null;
-			const stagedCapture = state.stagedCapture;
 			state.stagedCapture = null;
 			state.stagedEffectDeps = null;
 			if (state.hiddenDom) {
@@ -2081,6 +2176,10 @@ export function commitResumeInner(state: TrySlot): void {
 				// Ref attach closures captured by a hidden pass can be stale after a
 				// later same-node ref supersession. Reveal uses the current manifest.
 				if (state.detachedRefs !== null) stagedCapture.refs.length = 0;
+				if (stagedCapture.hostEvents !== undefined && ROOT_RENDER_TRANSACTION !== null) {
+					eventReveal = { state, capture: stagedCapture, releasedHold: false };
+					(ROOT_RENDER_TRANSACTION.hostEventReveals ??= []).push(eventReveal);
+				}
 				spliceOffscreenCapture(stagedCapture, deferredNativeAcceptance);
 				state.hasResolved = true;
 			} else {
@@ -2205,6 +2304,11 @@ export function commitResumeInner(state: TrySlot): void {
 	} finally {
 		if (hiddenActivity !== null) SCHEDULED_VISIBILITY_DRIVER!.rehide!(hiddenActivity);
 		if (releaseHeld) {
+			if (eventReveal !== undefined) {
+				eventReveal.releasedHold = true;
+				// A reentrant rollback may already have restored the parked slot.
+				if (state.stagedCapture === eventReveal.capture) state.transitionHeld = false;
+			}
 			tickTransitionCount(-1);
 			releaseTransitionHookHolder(state);
 		}

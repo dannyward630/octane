@@ -276,7 +276,7 @@ export function Benchmarks() @{
 								{'benchmarks/'}
 							</a>
 							{
-								' for what each suite measures. This snapshot measures Octane main at 6892fd6682 on 11 October 2026. See the '
+								' for what each suite measures. Signal-favoring uses Octane’s TSRX native signals at f2770fc1d8; the other suites measure main at 80d230b879. Both snapshots are from 21 October 2026. See the '
 							}
 							<a
 								href="https://github.com/octanejs/octane/blob/main/benchmarks/baselines/website-refresh.md"
@@ -285,7 +285,9 @@ export function Benchmarks() @{
 							>
 								measurement notes
 							</a>
-							{' for the source revision, environment, and reproduction command.'}
+							{
+								' for source revisions, environments, and reproduction commands. The signals refresh passed its semantic and work checks. The original full run breached 16 performance guards and failed two auxiliary diagnostics; its chart timing runs completed.'
+							}
 						</p>
 					</header>
 

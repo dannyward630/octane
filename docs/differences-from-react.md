@@ -1205,6 +1205,37 @@ Other current differences:
 - Child boundaries can leave empty comment anchors inside an `option`; its
   visible text and selected value are the supported observations.
 
+## Trusted Types
+
+As in React 19.3, a Trusted Types object reaches its DOM sink as the object, not
+its string. This covers `dangerouslySetInnerHTML.__html` and attributes such as
+`srcdoc`, a script's `src`, and SVG `xlinkHref`, so they work under an enforced
+`require-trusted-types-for 'script'`. Server rendering stringifies as before.
+
+What differs:
+
+- React parses no markup itself, but Octane does: compiled templates, binding
+  fragments, and streamed regions. That markup goes through a module-private
+  policy named `octane`. The streaming bootstrap script uses its own
+  `octane-stream` policy for JSON-carried boundaries. A CSP that lists
+  `trusted-types` must name both:
+
+  ```text
+  Content-Security-Policy: require-trusted-types-for 'script'; trusted-types octane octane-stream <your policies>
+  ```
+
+  A page that loads two copies of Octane also needs `'allow-duplicates'`.
+  Application strings never go through these policies.
+- `<script dangerouslySetInnerHTML>` writes the script's text, not its HTML
+  (see [Raw script and scoped style bodies](#raw-script-and-scoped-style-bodies)).
+  Under enforcement it takes a `TrustedScript`, where React takes `TrustedHTML`.
+- Only Trusted Types objects pass through. Other objects still stringify once
+  before the write; React hands every object to the sink.
+- A `TrustedScriptURL` that URL sanitizing blocks, such as a `javascript:`
+  URL, is written as the blocked string.
+- Float resource URLs (`preinit`, `preload`, hoisted async scripts) take
+  strings, as in React.
+
 ## Development diagnostics and production errors
 
 Octane progressively ports applicable development warnings and errors from the
@@ -1501,6 +1532,16 @@ startTransition(async () => {
 
 The nested transition joins the pending Action. This explicit post-`await`
 pattern is portable to React.
+
+Unrelated transitions commit independently, as React 19.3's parallel transitions
+do. A transition that suspends holds only its own work: another transition commits
+as soon as its data is ready, in a separate Suspense boundary or in the same one,
+and its `isPending` falls and its `useOptimistic` values revert when it commits.
+Transitions that update the same state stay entangled and commit together, with
+only the latest value rendered, as do the boundaries a single transition suspends.
+React has ten transition lanes and reuses them past ten, which can entangle
+transitions that share a lane. Octane tracks each transition separately and never
+does.
 
 Action result rendering is task-batched; Action callback invocation is not paced.
 As in React, a callback can run synchronously during dispatch, and queued callbacks
@@ -2160,8 +2201,9 @@ As in React:
   warning per hydration pass; production compares nothing. A `<textarea>`'s
   text takes the client's value.
 - `dangerouslySetInnerHTML` keeps the server's HTML in the same way, and
-  production compares nothing. The next render that passes an `__html` object
-  rewrites it, even with the same string.
+  production compares nothing. As in React 19.3, it stays, even where it
+  differs, until a render passes a different `__html` string. React 19.0 to
+  19.2 instead rewrite it on every render that passes a new `__html` object.
 - Texts that match after the HTML parser's normalization (CRLF to LF,
   stripped `\u0000` and `\uFFFD`) count as a match, and the server text stays.
   `suppressHydrationWarning` keeps the server text one level deep. It never

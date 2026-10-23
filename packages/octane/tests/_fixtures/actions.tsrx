@@ -1,4 +1,16 @@
-import { useActionState, useFormStatus, useOptimistic, useState } from 'octane';
+import {
+	createContext,
+	createPortal,
+	useActionState,
+	useContext,
+	useFormStatus,
+	useOptimistic,
+	useState,
+	Suspense,
+	startTransition,
+	useTransition,
+	use,
+} from 'octane';
 
 // useActionState wired to <form action={formAction}>. The action receives
 // (previousState, formData) and its resolved value becomes the new state.
@@ -44,6 +56,153 @@ export function FormWithStatus(props) @{
 			{'go'}
 		</button>
 	</form>
+}
+
+const PortalStatusContext = createContext('missing');
+
+function PortaledStatusButton() @{
+	const status = useFormStatus();
+	const scope = useContext(PortalStatusContext);
+	<button
+		id="portal-status"
+		type="submit"
+		form="save-form"
+		disabled={status.pending}
+		data-scope={scope}
+	>
+		{(status.pending ? 'pending:' + String(status.data?.get('draft')) : 'idle') as string}
+	</button>
+}
+
+export function PortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+}) @{
+	<PortalStatusContext value="owned">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			{createPortal(<PortaledStatusButton />, props.target)}
+		</form>
+	</PortalStatusContext>
+}
+
+export function FrontierPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="frontier">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			@if (show) {
+				<div id="portal-frontier">{createPortal(<PortaledStatusButton />, props.target)}</div>
+			}
+		</form>
+	</PortalStatusContext>
+}
+
+export function CommittedWrapperFrontierPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="committed-wrapper">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			<div id="committed-wrapper">
+				@if (show) {
+					<div id="portal-frontier">{createPortal(<PortaledStatusButton />, props.target)}</div>
+				}
+			</div>
+		</form>
+	</PortalStatusContext>
+}
+
+export function NestedPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	outerTarget: HTMLElement;
+	innerTarget: HTMLFormElement;
+}) @{
+	<PortalStatusContext value="nested">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			{createPortal(
+				<div id="outer-portal-host">
+					{createPortal(<PortaledStatusButton />, props.innerTarget)}
+				</div>,
+				props.outerTarget,
+			)}
+		</form>
+	</PortalStatusContext>
+}
+
+export function NestedFrontierPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	outerTarget: HTMLFormElement;
+	innerTarget: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="nested-frontier">
+		<form id="save-form" action={props.action}>
+			<input id="field" name="draft" defaultValue="saved" />
+			{createPortal(
+				<div id="outer-portal-host">
+					@if (show) {
+						<div id="inner-portal-frontier">
+							{createPortal(<PortaledStatusButton />, props.innerTarget)}
+						</div>
+					}
+				</div>,
+				props.outerTarget,
+			)}
+		</form>
+	</PortalStatusContext>
+}
+
+export function FrontierInnerFormPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="frontier-inner-form">
+		<form id="outer-form">
+			@if (show) {
+				<form id="save-form" action={props.action}>
+					<input id="field" name="draft" defaultValue="saved" />
+					{createPortal(<PortaledStatusButton />, props.target)}
+				</form>
+			}
+		</form>
+	</PortalStatusContext>
+}
+
+export function FrontierWrappedInnerFormPortaledFormWithStatus(props: {
+	action: (data: FormData) => void | Promise<void>;
+	target: HTMLElement;
+	expose: (show: () => void) => void;
+}) @{
+	const [show, setShow] = useState(false);
+	props.expose(() => setShow(true));
+	<PortalStatusContext value="wrapped-frontier-inner-form">
+		<form id="outer-form">
+			@if (show) {
+				<div id="frontier-wrapper">
+					<form id="save-form" action={props.action}>
+						<input id="field" name="draft" defaultValue="saved" />
+						{createPortal(<PortaledStatusButton />, props.target)}
+					</form>
+				</div>
+			}
+		</form>
+	</PortalStatusContext>
 }
 
 // RAW <form action={fn}> (not useActionState) + a useFormStatus child. Used to
@@ -137,6 +296,104 @@ export function OptimisticCounter(props: {
 	const [count, addOptimistic] = useOptimistic(props.count);
 	props.expose(addOptimistic);
 	<span id="count">{String(count) as string}</span>
+}
+
+function OptimisticDetails(props: { version: number; read: () => string }) @{
+	<span id="detail">{props.version === 0 ? 'old' : (props.read() as string)}</span>
+}
+
+export function OptimisticSuspenseAction(props: {
+	save: Promise<void>;
+	read: () => string;
+	suspend: boolean;
+}) @{
+	const [saved, setSaved] = useState(0);
+	const [pending, start] = useTransition();
+	const [optimistic, add] = useOptimistic(saved, (state: number, delta: number) => state + delta);
+	<div>
+		<button
+			id="save"
+			onClick={() =>
+				start(async () => {
+					add(1);
+					await props.save;
+					startTransition(() => setSaved(1));
+				})
+			}
+		>
+			{'save'}
+		</button>
+		<button id="bare-add" onClick={() => add(10)}>
+			{'add outside transition'}
+		</button>
+		<output id="saved">{String(saved) as string}</output>
+		<output id="optimistic">{String(optimistic) as string}</output>
+		<output id="pending">{(pending ? 'pending' : 'idle') as string}</output>
+		<Suspense fallback={<span id="fallback">{'loading'}</span>}>
+			<OptimisticDetails version={props.suspend ? saved : 0} read={props.read} />
+		</Suspense>
+	</div>
+}
+
+export function SuspendedTransitionRoot(props: { read: () => string }) @{
+	const [version, setVersion] = useState(0);
+	const [pending, start] = useTransition();
+	<section>
+		<button id="navigate" onClick={() => start(() => setVersion(1))}>
+			{'navigate'}
+		</button>
+		<output id="pending">{(pending ? 'pending' : 'idle') as string}</output>
+		<Suspense fallback={<span id="fallback">{'loading'}</span>}>
+			<OptimisticDetails version={version} read={props.read} />
+		</Suspense>
+	</section>
+}
+
+// An urgent update supersedes a held transition while the boundary renders,
+// finishing the batch that owns the parent's optimistic update mid-render.
+export function OptimisticSupersededTransition(props: {
+	initial: Promise<string>;
+	next: Promise<string>;
+	urgent: Promise<string>;
+}) @{
+	const [optimistic, add] = useOptimistic(0, (state: number, delta: number) => state + delta);
+	<div>
+		<output id="optimistic">{String(optimistic) as string}</output>
+		<SupersededValue {...props} add={add} />
+	</div>
+}
+
+function SupersededValue(props: {
+	initial: Promise<string>;
+	next: Promise<string>;
+	urgent: Promise<string>;
+	add: (delta: number) => void;
+}) @{
+	const [promise, setPromise] = useState(props.initial);
+	const [pending, start] = useTransition();
+	<section>
+		<button
+			id="transition"
+			onClick={() =>
+				start(() => {
+					props.add(1);
+					setPromise(props.next);
+				})
+			}
+		>
+			{'transition'}
+		</button>
+		<button id="urgent" onClick={() => setPromise(props.urgent)}>
+			{'urgent'}
+		</button>
+		<output id="pending">{(pending ? 'pending' : 'idle') as string}</output>
+		@try {
+			const value = use(promise);
+			<span id="value">{value as string}</span>
+		} @pending {
+			<span id="fallback">{'loading'}</span>
+		}
+	</section>
 }
 
 // Direct dispatch: formAction(payload) called outside a <form>.

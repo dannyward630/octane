@@ -28,7 +28,7 @@ import type {
 } from './view-transition.js';
 import type { TrackedThenable } from './use.js';
 import type { HookUpdate, TransitionHookSlot } from './transitions.js';
-import type { Context, DEFAULT_CTX, DirectContextRead } from './context.js';
+import type { Context, DEFAULT_CTX, DirectContextReads } from './context.js';
 import type { PortalSlot } from './portals.js';
 import type { BlockKind, BlockRare, SLOT_FLAG_TEARDOWN } from './block.js';
 import type {
@@ -368,11 +368,11 @@ export interface Block extends Scope {
 	 */
 	inactive: boolean;
 	/** Direct (own) context reads this render — drives memo invalidation alongside $$ctxReads. */
-	$$ctxDirect: Map<Context<any>, DirectContextRead> | null;
+	$$ctxDirect: DirectContextReads | null;
 	/**
 	 * The context epoch at which this block's $$ctxReads/$$ctxDirect
 	 * entries were last known consistent with live context versions: sampled when
-	 * renderBlock clears the maps (this render repopulates them at current
+	 * renderBlock clears the dependencies (this render repopulates them at current
 	 * versions) and re-stamped after a bailout verifies every recorded entry.
 	 * While it equals the current epoch NO context anywhere has changed since, so
 	 * the per-bail version scans are provably redundant. restampCtxDeps poisons it
@@ -510,6 +510,8 @@ export interface TransitionActionBatch {
 	waiting: number;
 	/** Set once its work and every hold are over (finishTransitionHookBatch). */
 	finished: boolean;
+	/** Runtime callbacks waiting for this batch's work and every hold to finish. */
+	finishListeners: Set<() => void> | null;
 	/** Holds keeping it from rendering (TransitionHold.suspends). */
 	suspended: number;
 	/** Profile builds only: queued updates as (cell, block, cause, slot) quadruples. */
@@ -554,7 +556,8 @@ export interface RootRenderOwner {
 	hydrationFallback?: ((failed: boolean) => SlotNext | null) | undefined;
 	bindingContainer?: Node;
 	adopt?: ((block: Block) => void) | undefined;
-	retry: () => void;
+	/** Render the latest request again; `deferred` renders it as a spawned deferred pass. */
+	retry: (deferred?: boolean) => void;
 	request: ((mode: 'urgent' | 'transition') => void) | null;
 	generation: number;
 	wakeable: PromiseLike<unknown> | null;
@@ -570,6 +573,12 @@ export interface RootRenderOwner {
 	spareOps: any[] | null;
 }
 
+export interface HydrationEventReveal {
+	state: TrySlot;
+	capture: OffscreenCapture;
+	releasedHold: boolean;
+}
+
 export interface RootRenderTransaction {
 	owner: RootRenderOwner;
 	log: any[];
@@ -583,7 +592,7 @@ export interface RootRenderTransaction {
 	retired: Set<Block> | null;
 	/**
 	 * The commit queue: `(fn, target)` pairs that commitRootRenders runs in render
-	 * order, before refs and layout effects. A template queues `(C, bag)`
+	 * order, before refs and layout effects. A template queues `(commitQueuedBag, bag)`
 	 * (bagDone); a slot whose structure changed queues `(applySlotNext, slot)`
 	 * when it starts reconciling, ahead of its descendants' entries. A dropped
 	 * window truncates the queue and touches no DOM (dropRootOps).
@@ -603,6 +612,8 @@ export interface RootRenderTransaction {
 	texts: Set<Text> | null;
 	aborted: boolean;
 	rootRequest: boolean;
+	/** Parked reveals whose staged host events this root must accept. */
+	hostEventReveals?: HydrationEventReveal[];
 	hydrating?: boolean;
 	/** A ViewTransition holds its commit for the native update (vtFlush). */
 	held?: boolean;
@@ -793,6 +804,9 @@ export interface OffscreenCapture {
 	renderCleanups: Array<(discarded: boolean) => void> | undefined;
 	/** Only a structural binding lease records current-tree adoption receipts. */
 	presentations?: PresentationHydrationFrame[];
+	/** Host events become observable at root acceptance, before mutation callbacks. */
+	hostEvents?:
+		Array<(() => void | (() => void)) & { recover?: (error: unknown) => void }> | undefined;
 }
 
 // A target has one effective ref binding; array refs remain one composite value.

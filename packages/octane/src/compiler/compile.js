@@ -1633,7 +1633,12 @@ function requireRuntimeForContext(ctx, name) {
 		name === '__delegateEvents' ||
 		name === '__delegateCaptureEvents' ||
 		name === '__sameHydrationInput' ||
+		name === '__sameHydrationSource' ||
+		name === '__sameHydrationOptionalInput' ||
+		name === '__observeHydrationOptionalInput' ||
 		name === '__captureHydrationInput' ||
+		name === '__beginHydrationQueryRead' ||
+		name === '__readHydrationQueryInput' ||
 		name === '__hydrationSignalRevision' ||
 		name === '__hydrationComponentSlot' ||
 		name === '__registerHydrationInputComponent' ||
@@ -1745,6 +1750,9 @@ const INTERNAL_CLIENT_RUNTIME_HELPERS = new Set([
 	'__registerHydrationInputComponent',
 	'__ownedHydrationInputs',
 	'__sameHydrationInput',
+	'__sameHydrationSource',
+	'__sameHydrationOptionalInput',
+	'__observeHydrationOptionalInput',
 	'__createVoidRootDefaultOptions',
 	'__createRootDefaultOptions',
 	'__delegateEvents',
@@ -1756,6 +1764,7 @@ const INTERNAL_CLIENT_RUNTIME_HELPERS = new Set([
 	'beginPresentationHydration',
 	'endPresentationHydration',
 	'presentationWrite',
+	'presentationFixedWrite',
 	'renderWrite',
 	'presentationHostWrite',
 	'presentationStructure',
@@ -1842,6 +1851,11 @@ function runtimeImportModuleFor(ctx, fallback, imported, local) {
 	if (local === (ctx.privateRuntimeAliases?.get(imported) ?? rtAlias(imported))) {
 		if (fallback === 'octane' && imported === '__hydrationSignalRevision')
 			return 'octane/internal/hydration-signal';
+		if (
+			fallback === 'octane' &&
+			(imported === '__beginHydrationQueryRead' || imported === '__readHydrationQueryInput')
+		)
+			return 'octane/internal/hydration-query';
 		if (fallback === 'octane' && INTERNAL_CLIENT_RUNTIME_HELPERS.has(imported)) {
 			return 'octane/internal/client';
 		}
@@ -7551,7 +7565,7 @@ function privateHydrationPropsSites(ctx) {
 // before the boundary. Record every first-level read so callers can prove it
 // was an own data property before setup. A zero-argument `.get()` may read a
 // signal or another nested receiver, never the ephemeral props record itself.
-function hydrationSetupExpression(node, propsName, required, setupLocals) {
+function hydrationSetupExpression(node, propsName, required, setupLocals, projectedGet = null) {
 	node = unwrapTsExpr(node);
 	if (!node) return false;
 	switch (node.type) {
@@ -7568,15 +7582,18 @@ function hydrationSetupExpression(node, propsName, required, setupLocals) {
 			)
 				return false;
 			let receiver = unwrapTsExpr(member.object);
-			if (receiver?.type === 'Identifier') receiver = unwrapTsExpr(setupLocals.get(receiver.name));
-			// The optional read stays in authored setup. Its receiver must be an
-			// own-data props field, possibly held by one preceding const local.
+			if (receiver?.type === 'Identifier') {
+				receiver = unwrapTsExpr(setupLocals.get(receiver.name));
+			}
+			// The optional read stays in authored setup. Own-data props fields
+			// qualify directly; a projected call result needs the separate query proof.
 			return (
-				receiver?.type === 'MemberExpression' &&
-				!receiver.optional &&
-				receiver.object?.type === 'Identifier' &&
-				receiver.object.name === propsName &&
-				hydrationSetupExpression(receiver, propsName, required, setupLocals)
+				(receiver?.type === 'MemberExpression' &&
+					!receiver.optional &&
+					receiver.object?.type === 'Identifier' &&
+					receiver.object.name === propsName &&
+					hydrationSetupExpression(receiver, propsName, required, setupLocals, projectedGet)) ||
+				(projectedGet !== null && projectedGet(receiver))
 			);
 		}
 		case 'MemberExpression': {
@@ -7586,7 +7603,7 @@ function hydrationSetupExpression(node, propsName, required, setupLocals) {
 				required.add(field);
 				return true;
 			}
-			return hydrationSetupExpression(node.object, propsName, required, setupLocals);
+			return hydrationSetupExpression(node.object, propsName, required, setupLocals, projectedGet);
 		}
 		case 'CallExpression': {
 			const callee = unwrapTsExpr(node.callee);
@@ -7596,33 +7613,78 @@ function hydrationSetupExpression(node, propsName, required, setupLocals) {
 				callee?.type === 'MemberExpression' &&
 				!callee.optional &&
 				staticDepMemberName(callee) === 'get' &&
-				hydrationSetupExpression(callee.object, propsName, required, setupLocals)
+				hydrationSetupExpression(callee.object, propsName, required, setupLocals, projectedGet)
 			);
 		}
 		case 'UnaryExpression':
 			return (
 				node.operator !== 'delete' &&
-				hydrationSetupExpression(node.argument, propsName, required, setupLocals)
+				hydrationSetupExpression(node.argument, propsName, required, setupLocals, projectedGet)
 			);
 		case 'BinaryExpression':
 		case 'LogicalExpression':
 			return (
-				hydrationSetupExpression(node.left, propsName, required, setupLocals) &&
-				hydrationSetupExpression(node.right, propsName, required, setupLocals)
+				hydrationSetupExpression(node.left, propsName, required, setupLocals, projectedGet) &&
+				hydrationSetupExpression(node.right, propsName, required, setupLocals, projectedGet)
 			);
 		case 'ConditionalExpression':
 			return (
-				hydrationSetupExpression(node.test, propsName, required, setupLocals) &&
-				hydrationSetupExpression(node.consequent, propsName, required, setupLocals) &&
-				hydrationSetupExpression(node.alternate, propsName, required, setupLocals)
+				hydrationSetupExpression(node.test, propsName, required, setupLocals, projectedGet) &&
+				hydrationSetupExpression(node.consequent, propsName, required, setupLocals, projectedGet) &&
+				hydrationSetupExpression(node.alternate, propsName, required, setupLocals, projectedGet)
 			);
 		case 'TemplateLiteral':
 			return node.expressions.every((expression) =>
-				hydrationSetupExpression(expression, propsName, required, setupLocals),
+				hydrationSetupExpression(expression, propsName, required, setupLocals, projectedGet),
 			);
 		default:
 			return false;
 	}
+}
+
+// This identifier names the same imported binding across every render. The
+// runtime separately proves that its actual read suspended on a native query.
+function hydrationImportedGetReceiver(ctx, node) {
+	const read = unwrapTsExpr(node);
+	const callee = read?.callee;
+	const receiver = callee?.object;
+	if (
+		read?.type !== 'CallExpression' ||
+		read.optional ||
+		read.arguments.length !== 0 ||
+		callee?.type !== 'MemberExpression' ||
+		callee.optional ||
+		staticDepMemberName(callee) !== 'get' ||
+		receiver?.type !== 'Identifier'
+	)
+		return null;
+	const lexical = (ctx.activityLexical ??= createLexicalAnalysis(ctx.activityModuleAst));
+	const binding = lexical.resolveBinding(lexical.nodeScopes.get(receiver), receiver.name);
+	return binding?.scope === lexical.rootScope && binding.importSource !== null ? receiver : null;
+}
+
+function hydrationFirstQueryRead(ctx, render) {
+	const first = render.block.body[0];
+	if (
+		first?.type !== 'VariableDeclaration' ||
+		first.kind !== 'const' ||
+		first.declarations.length !== 1 ||
+		first.declarations[0].id.type !== 'Identifier'
+	)
+		return null;
+	let read = unwrapTsExpr(first.declarations[0].init);
+	let guard = null;
+	if (read?.type === 'ConditionalExpression') {
+		const condition = unwrapTsExpr(read.test);
+		if (condition?.type !== 'Identifier') return null;
+		guard = condition;
+		read = unwrapTsExpr(read.consequent);
+	}
+	// Type syntax inside the call cannot move out of this component's scope.
+	if (read?.typeArguments || (read?.callee?.computed && read.callee.property?.type !== 'Literal'))
+		return null;
+	const receiver = hydrationImportedGetReceiver(ctx, read);
+	return receiver === null ? null : { receiver, guard };
 }
 
 function confinedHydrationDerivedRead(render, name, propsName = null) {
@@ -7690,14 +7752,53 @@ function hydrationBlockingBodies(ctx, bodies) {
 	return [{ ...bodies[0], stmts }, ...bodies.slice(1)];
 }
 
+function hydrationLayoutCaptureName(node, propsName) {
+	const name = node?.type === 'Identifier' ? node.name : null;
+	return name === propsName || name === 'arguments' || name === 'eval' ? null : name;
+}
+
+// Inference witnesses the first optional member. Keep that generated read
+// dependency intact; the authored effect still evaluates the full chain.
+function hydrationLayoutReadCapture(node, propsName) {
+	if (node?.type !== 'ChainExpression') return null;
+	let member = node.expression;
+	for (let depth = 0; depth < 2; depth++) {
+		if (
+			member?.type !== 'MemberExpression' ||
+			!member.optional ||
+			member.computed ||
+			member.property?.type !== 'Identifier'
+		)
+			return null;
+		const name = hydrationLayoutCaptureName(member.object, propsName);
+		if (name !== null) return [name, member.property.name];
+		member = member.object;
+	}
+	return null;
+}
+
+function hydrationLayoutMethodDep(node, helper, receiver, field, guarded, read = false) {
+	return (
+		node?.type === 'CallExpression' &&
+		!node.optional &&
+		node.callee?.type === 'Identifier' &&
+		node.callee.name === helper &&
+		node.arguments.length === (read ? 4 : guarded ? 3 : 2) &&
+		node.arguments[0]?.type === 'Identifier' &&
+		node.arguments[0].name === receiver &&
+		node.arguments[1]?.type === 'Literal' &&
+		node.arguments[1].value === field &&
+		(!guarded || (node.arguments[2]?.type === 'Literal' && node.arguments[2].value === true)) &&
+		(!read || (node.arguments[3]?.type === 'Literal' && node.arguments[3].value === true))
+	);
+}
+
 // A layout callback is published only after an arm commits. Dependency
 // inference still evaluates its method witness during render, so require that
 // field to be own data without treating the callback as a blocking input.
 // Change only this analysis copy; the emitted hook, deps and receiver stay intact.
-function hydrationLayoutBodies(ctx, bodies, propsName, required) {
-	const methodDepLocal = ctx.privateRuntimeAliases?.get(METHOD_DEP_IMPORT);
-	if (methodDepLocal === undefined) return bodies;
-	const stmts = bodies[0].stmts;
+function hydrationLayoutBody(body, methodDepLocal, propsName, required) {
+	const stmts = body.stmts;
 	let next = null;
 	for (let index = 0; index < stmts.length; index++) {
 		const statement = stmts[index];
@@ -7711,40 +7812,85 @@ function hydrationLayoutBodies(ctx, bodies, propsName, required) {
 			callback.params.length !== 0 ||
 			callback.body.type !== 'BlockStatement' ||
 			callback.body.body.length !== 1 ||
-			callback.body.body[0].type !== 'ExpressionStatement' ||
-			deps?.type !== 'ArrayExpression' ||
-			deps.elements.length !== 2
+			deps?.type !== 'ArrayExpression'
 		)
 			continue;
-		const expression = callback.body.body[0].expression;
+		let action = callback.body.body[0];
+		let guard = null;
+		if (action.type === 'IfStatement') {
+			guard = hydrationLayoutCaptureName(action.test, propsName);
+			if (guard === null || action.alternate !== null) continue;
+			action = action.consequent;
+			if (action.type === 'BlockStatement' && action.body.length === 1) action = action.body[0];
+		}
+		if (action.type !== 'ExpressionStatement') continue;
+		const expression = action.expression;
 		const invoked = expression.type === 'ChainExpression' ? expression.expression : expression;
 		const member = invoked?.callee;
-		const argument = invoked?.arguments?.[0];
 		const field = staticDepMemberName(member);
-		const [method, value] = deps.elements;
 		if (
 			invoked?.type !== 'CallExpression' ||
-			invoked.arguments.length !== 1 ||
+			invoked.arguments.length === 0 ||
 			member?.type !== 'MemberExpression' ||
 			member.optional ||
 			field === null ||
 			member.object?.type !== 'Identifier' ||
-			member.object.name !== propsName ||
-			argument?.type !== 'Identifier' ||
-			argument.name === propsName ||
-			method?.type !== 'CallExpression' ||
-			method.optional ||
-			method.callee?.type !== 'Identifier' ||
-			method.callee.name !== methodDepLocal ||
-			method.arguments.length !== 2 ||
-			method.arguments[0]?.type !== 'Identifier' ||
-			method.arguments[0].name !== propsName ||
-			method.arguments[1]?.type !== 'Literal' ||
-			method.arguments[1].value !== field ||
-			value?.type !== 'Identifier' ||
-			value.name !== argument.name
+			member.object.name !== propsName
 		)
 			continue;
+		// Inferred dependencies deduplicate repeated arguments. Require the exact
+		// set of lexical captures and retain those dependencies in the analysis.
+		const captures = new Set();
+		if (guard !== null) captures.add(guard);
+		let readCapture = null;
+		let valid = true;
+		for (const argument of invoked.arguments) {
+			if (argument?.type === 'Literal' && argument.value === null) continue;
+			const name = hydrationLayoutCaptureName(argument, propsName);
+			if (name !== null) {
+				captures.add(name);
+				continue;
+			}
+			if (
+				guard !== null &&
+				readCapture === null &&
+				(readCapture = hydrationLayoutReadCapture(argument, propsName)) !== null
+			)
+				continue;
+			valid = false;
+			break;
+		}
+		if (!valid || deps.elements.length !== captures.size + 1 + (readCapture === null ? 0 : 1))
+			continue;
+		let methodIndex = -1;
+		for (let depIndex = 0; depIndex < deps.elements.length; depIndex++) {
+			const dependency = deps.elements[depIndex];
+			if (dependency?.type === 'Identifier' && captures.delete(dependency.name)) continue;
+			if (
+				readCapture !== null &&
+				hydrationLayoutMethodDep(
+					dependency,
+					methodDepLocal,
+					readCapture[0],
+					readCapture[1],
+					true,
+					true,
+				)
+			) {
+				readCapture = null;
+				continue;
+			}
+			if (
+				methodIndex === -1 &&
+				hydrationLayoutMethodDep(dependency, methodDepLocal, propsName, field, guard !== null)
+			) {
+				methodIndex = depIndex;
+				continue;
+			}
+			valid = false;
+			break;
+		}
+		if (!valid || methodIndex === -1 || captures.size !== 0 || readCapture !== null) continue;
 		// The helper alias is allocated against every authored identifier before
 		// inference, so an explicit dependency list cannot counterfeit this call.
 		required.add(field);
@@ -7752,26 +7898,78 @@ function hydrationLayoutBodies(ctx, bodies, propsName, required) {
 			...statement,
 			expression: {
 				...effect,
-				arguments: [b.arrow([], b.block([])), { ...deps, elements: [value] }],
+				arguments: [
+					b.arrow([], b.block([])),
+					{ ...deps, elements: deps.elements.filter((_, depIndex) => depIndex !== methodIndex) },
+				],
 			},
 		};
 	}
-	return next === null ? bodies : [{ ...bodies[0], stmts: next }, ...bodies.slice(1)];
+	return next === null ? body : { ...body, stmts: next };
 }
 
-// An exported component can also receive arbitrary caller-owned props. Its
-// comparator requires provenance from each actual invocation: same-module JSX
-// sites prove own fields statically; imported spreads use a callable capability.
-function exportedHydrationPropsPlans(ctx) {
+function hydrationLayoutBodies(ctx, bodies, propsName, required) {
+	const methodDepLocal = ctx.privateRuntimeAliases?.get(METHOD_DEP_IMPORT);
+	if (methodDepLocal === undefined) return bodies;
+	// Pending can publish while adoption is unresolved, so analyze it unchanged.
+	const primary = hydrationLayoutBody(bodies[0], methodDepLocal, propsName, required);
+	const caught = bodies[2] && hydrationLayoutBody(bodies[2], methodDepLocal, propsName, required);
+	return primary === bodies[0] && caught === bodies[2] ? bodies : [primary, bodies[1], caught];
+}
+
+// Only a direct optional call at the first authored operation can place an
+// observation immediately beside the actual read without moving user code.
+function hydrationFirstOptionalReader(body, propsName) {
+	const statement = body.stmts[0];
+	const declaration = statement?.declarations?.[0];
+	const init = declaration?.init;
+	const chain = init?.left;
+	const call = chain?.expression;
+	const member = call?.callee;
+	if (
+		statement?.type !== 'VariableDeclaration' ||
+		statement.kind !== 'const' ||
+		statement.declarations.length !== 1 ||
+		declaration.id.type !== 'Identifier' ||
+		init?.type !== 'LogicalExpression' ||
+		init.operator !== '??' ||
+		chain?.type !== 'ChainExpression' ||
+		call?.type !== 'CallExpression' ||
+		!call.optional ||
+		call.arguments.length !== 0 ||
+		member?.type !== 'MemberExpression' ||
+		member.optional ||
+		member.computed ||
+		member.object?.type !== 'Identifier' ||
+		member.object.name !== propsName ||
+		member.property?.type !== 'Identifier'
+	)
+		return null;
+	return { field: member.property.name, propsName };
+}
+
+function replaceHydrationFirstOptionalReader(body, left) {
+	const statement = body.stmts[0];
+	const declaration = statement.declarations[0];
+	return {
+		...body,
+		stmts: [
+			{ ...statement, declarations: [{ ...declaration, init: { ...declaration.init, left } }] },
+			...body.stmts.slice(1),
+		],
+	};
+}
+
+// The comparator requires provenance from each actual invocation: same-module
+// JSX sites prove own fields statically; exported components can also accept
+// imported spreads through a callable capability.
+function hydrationPropsPlans(ctx) {
 	const plans = new Map();
 	const candidates = new Set();
 	for (const statement of ctx.hydrationPropsModule.body) {
-		if (
-			statement.type !== 'ExportNamedDeclaration' &&
-			statement.type !== 'ExportDefaultDeclaration'
-		)
-			continue;
-		const component = statement.declaration;
+		const exported =
+			statement.type === 'ExportNamedDeclaration' || statement.type === 'ExportDefaultDeclaration';
+		const component = exported ? statement.declaration : statement;
 		if (
 			component?.type !== 'FunctionDeclaration' ||
 			component.body?.type !== 'JSXCodeBlock' ||
@@ -7782,10 +7980,16 @@ function exportedHydrationPropsPlans(ctx) {
 			ctx.moduleFunctionDeclarations.get(component.id?.name) !== component
 		)
 			continue;
+		const privateQuery =
+			!exported && component.body.body.length > 0
+				? hydrationFirstQueryRead(ctx, component.body.render)
+				: null;
+		if (!exported && privateQuery === null) continue;
 		const propsName = component.params[0].name;
 		const required = new Set();
 		const setupLocals = new Map();
 		let derived = null;
+		let query = null;
 		let safe = true;
 		for (const setup of component.body.body) {
 			if (
@@ -7827,14 +8031,41 @@ function exportedHydrationPropsPlans(ctx) {
 				)
 					derived = { name: declaration.id.name, field: proof.field };
 				else if (!hydrationSetupExpression(declaration.init, propsName, required, setupLocals)) {
-					safe = false;
-					break;
+					// Equal setup projections alone cannot establish request continuity.
+					// Only admit one when the first primary operation reads an imported
+					// query whose original suspension can be authenticated at runtime.
+					query ??= privateQuery ?? hydrationFirstQueryRead(ctx, component.body.render);
+					if (
+						query === null ||
+						!hydrationSetupExpression(
+							declaration.init,
+							propsName,
+							required,
+							setupLocals,
+							(read) => hydrationImportedGetReceiver(ctx, read) !== null,
+						)
+					) {
+						safe = false;
+						break;
+					}
 				}
 				setupLocals.set(declaration.id.name, declaration.init);
 			}
 			if (!safe) break;
 		}
-		if (!safe) continue;
+		if (!safe || (!exported && query === null) || (query !== null && derived !== null)) continue;
+		if (query?.guard) {
+			const initializer = setupLocals.get(query.guard.name);
+			const lexical = ctx.activityLexical;
+			const binding = lexical.resolveBinding(lexical.nodeScopes.get(query.guard), query.guard.name);
+			// A same-named declaration inside the primary arm is not the setup binding.
+			if (
+				initializer === undefined ||
+				binding === null ||
+				binding.scope !== lexical.nodeScopes.get(initializer)
+			)
+				continue;
+		}
 		const bodies = hydrationLayoutBodies(
 			ctx,
 			tryBodies(component.body.render, ctx),
@@ -7847,12 +8078,28 @@ function exportedHydrationPropsPlans(ctx) {
 			derived ? hydrationBlockingBodies(ctx, bodies) : bodies,
 		);
 		if (fields === null) continue;
+		let optional = hydrationFirstOptionalReader(bodies[0], propsName);
+		if (optional !== null) {
+			// An optional first call cannot weaken any other use of the same field.
+			const remaining =
+				fields.get(optional.field) === false && !required.has(optional.field)
+					? hydrationPropsFields(ctx, propsName, [
+							replaceHydrationFirstOptionalReader(bodies[0], b.literal(null)),
+							...bodies.slice(1),
+						])
+					: null;
+			if (remaining === null || remaining.has(optional.field)) optional = null;
+			else fields.delete(optional.field);
+		}
 		if (derived?.field) fields.set(derived.field, false);
 		for (const field of fields.keys()) required.add(field);
 		plans.set(component.id.name, {
+			exported,
 			fields,
+			optional,
 			derived: derived?.source ? null : derived,
 			source: derived?.source,
+			query,
 			origin: component,
 			required: { warmRequiredProps: required },
 			sites: new Set(),
@@ -7872,10 +8119,12 @@ function exportedHydrationPropsPlans(ctx) {
 		plan.sites.add(tag);
 		return true;
 	});
-	// HMR can rebind the exported wrapper after definition-site initialization.
+	// A private plan needs an admitted local callsite. HMR can also rebind the
+	// exported wrapper after definition-site initialization.
 	// Keep the existing same-module proof there; do not issue a cross-module
 	// callable capability whose required fields could belong to an older body.
-	if (ctx.hmr) for (const [name, plan] of plans) if (plan.sites.size === 0) plans.delete(name);
+	for (const [name, plan] of plans)
+		if (plan.sites.size === 0 && (ctx.hmr || !plan.exported)) plans.delete(name);
 	return plans;
 }
 
@@ -7888,14 +8137,14 @@ function hydrationInputPlanName(ctx, plan) {
 	));
 }
 
-function exportedHydrationPropsPlan(ctx, name) {
+function hydrationPropsPlan(ctx, name) {
 	if (
 		ctx.mode !== 'client' ||
 		ctx._universalRuntimeUnit != null ||
 		ctx.componentInfo?.get(name)?.node.body?.render?.type !== 'JSXTryExpression'
 	)
 		return null;
-	return (ctx.exportedHydrationPropsPlans ??= exportedHydrationPropsPlans(ctx)).get(name) ?? null;
+	return (ctx.hydrationPropsPlans ??= hydrationPropsPlans(ctx)).get(name) ?? null;
 }
 
 // An authored @for normally hides its children from speculative warming: its
@@ -9105,6 +9354,37 @@ function isReturnJsxFunction(node) {
 	return false;
 }
 
+// An uppercase `const X = (…) => <jsx/>` (or function expression, or a
+// single-argument `memo(…)` of one) exported by name or through
+// `export default X`. It compiles as a plain value, so HMR registers its binding
+// rather than a lowered component declaration.
+/** @param {any} node @param {Set<string>} defaultNames @param {(callee: any) => boolean} isMemoCallee @returns {{ name: string, exportKind: 'named' | 'default', memo: boolean } | null} */
+function hmrValueComponent(node, defaultNames, isMemoCallee) {
+	const exported = node.type === 'ExportNamedDeclaration';
+	const declaration = exported ? node.declaration : node;
+	if (
+		declaration?.type !== 'VariableDeclaration' ||
+		declaration.kind !== 'const' ||
+		declaration.declarations.length !== 1
+	)
+		return null;
+	const declarator = declaration.declarations[0];
+	if (declarator.id?.type !== 'Identifier' || !/^[A-Z]/.test(declarator.id.name)) return null;
+	const name = declarator.id.name;
+	if (!exported && !defaultNames.has(name)) return null;
+	const init = declarator.init;
+	const memo =
+		init?.type === 'CallExpression' && init.arguments.length === 1 && isMemoCallee(init.callee);
+	const fn = unwrapTsExpr(memo ? init.arguments[0] : init);
+	if (fn?.type !== 'ArrowFunctionExpression' && fn?.type !== 'FunctionExpression') return null;
+	if (fn.async || fn.generator || !fn.body) return null;
+	const returnsJsx =
+		fn.body.type === 'BlockStatement'
+			? fn.body.body.some(statementHasOwnedJsxReturn)
+			: isJsxNode(fn.body);
+	return returnsJsx ? { name, exportKind: exported ? 'named' : 'default', memo } : null;
+}
+
 /** @param {any} stmt @returns {boolean} */
 function statementHasOwnedJsxReturn(stmt) {
 	if (!stmt) return false;
@@ -10147,7 +10427,7 @@ function runtimeExportBindings(body) {
 		if (node.type === 'ExportAllDeclaration') {
 			bindings.push([null, null]);
 		} else if (node.type === 'ExportDefaultDeclaration') {
-			const value = node.declaration;
+			const value = unwrapTsExpr(node.declaration);
 			bindings.push([
 				'default',
 				value.type === 'Identifier'
@@ -11828,6 +12108,16 @@ function compileAuthored(source, filename, options, bundlerMetadata, analyzed = 
 	return result;
 }
 
+// Directives must precede generated imports and setup to remain a module prologue.
+function moduleDirectives(body) {
+	const directives = [];
+	for (const statement of body) {
+		if (typeof statement.directive !== 'string') break;
+		directives.push(statement);
+	}
+	return directives;
+}
+
 function compileInternal(
 	source,
 	filename,
@@ -12373,6 +12663,7 @@ function compileInternal(
 		hoistedTemplates: [], // { name, ast, html, ns, frag, origins }
 		internedTemplates: new Map(), // HTML -> one template or namespace/fragment variants
 		hoistedHelpers: [], // statement NODES (sub-components, hook Symbols, key fns) + hook-slot-base markers
+		commitFunctions: new Map(), // structural key -> { name, body } of a shared commit function (emitCommitFunction)
 		delegatedEvents: new Set(), // bubble event names seen in JSX — auto-emits delegateEvents(...)
 		capturedEvents: new Set(), // capture-phase event names (onXxxCapture) — auto-emits delegateCaptureEvents(...)
 		// Descriptor capabilities this module's JSX values can select (see
@@ -12439,6 +12730,11 @@ function compileInternal(
 		// single module print must carry a loc (OCTANE_COMPILE_ASSERT_LOC).
 		_moduleOrigin: ast.body.find((n) => n?.loc != null) ?? ast,
 	};
+	if (ctx.inspect) {
+		for (const unit of [options?.__universal, ...universalUnits]) {
+			for (const sheet of unit?.styles ?? []) claimCssOrigins(ctx, sheet);
+		}
+	}
 	ctx.privateWarmLists = source.includes('@for') ? collectPrivateWarmLists(ast.body) : null;
 	if (hookDepHelperLocal !== null) {
 		ctx.runtimeNeeded.add(METHOD_DEP_IMPORT);
@@ -13229,8 +13525,41 @@ function compileInternal(
 	// esrap at the end, which also yields the entire module source map.
 	ctx.hydrationPropsModule = ast;
 	const bodyNodes = emitServerModuleClientStubs(serverModuleInfo, ctx);
+	const directiveNodes = moduleDirectives(ast.body);
 	const compileOpts = { hmrWrap: hmrEnabled, hmrMutable: hmrEnabled };
-	for (let node of ast.body) {
+	// Exported `const X = () => <jsx/>` components stay plain values; HMR rebinds
+	// them like lowered components. Keyed by authored top-level statement.
+	const hmrValueComponents = new Map();
+	const hmrDefaultValues = new Set();
+	const hmrDefaultFunctions = new Set();
+	if (
+		hmrEnabled &&
+		(options?.renderer?.target ?? 'dom') === 'dom' &&
+		universalRuntime === undefined &&
+		options?.__universal == null
+	) {
+		const defaultNames = new Set();
+		for (const node of ast.body)
+			if (
+				node.type === 'ExportDefaultDeclaration' &&
+				unwrapTsExpr(node.declaration)?.type === 'Identifier'
+			)
+				defaultNames.add(unwrapTsExpr(node.declaration).name);
+		for (const node of ast.body) {
+			const component = hmrValueComponent(node, defaultNames, (callee) =>
+				isOctaneMemoCallee(callee, ctx, memoImportNames),
+			);
+			if (
+				(isComponentFunction(node) || isReturnJsxFunction(node)) &&
+				defaultNames.has(node.id.name)
+			)
+				hmrDefaultFunctions.add(node.id.name);
+			if (component === null) continue;
+			hmrValueComponents.set(node, component);
+			if (component.exportKind === 'default') hmrDefaultValues.add(component.name);
+		}
+	}
+	for (let node of ast.body.slice(directiveNodes.length)) {
 		const firstStatement = bodyNodes.length;
 		if (
 			node === serverModuleInfo?.declaration ||
@@ -13238,7 +13567,23 @@ function compileInternal(
 		) {
 			continue;
 		}
-		if (isComponentFunction(node)) {
+		if (hmrDefaultFunctions.has(node.id?.name) && node.type === 'FunctionDeclaration') {
+			// `function Foo() {…}` exported through `export default Foo` compiles
+			// like `export default function Foo() {…}`; that export is dropped below.
+			const c = { ...node, default: true };
+			bodyNodes.push(
+				...(isComponentFunction(node)
+					? compileComponent(c, ctx, compileOpts)
+					: compileReturnJsxFunction(node, ctx, { default: true, ...compileOpts })
+				).nodes,
+			);
+			hmrComponents.push({ name: node.id.name, exportKind: 'default' });
+		} else if (
+			node.type === 'ExportDefaultDeclaration' &&
+			hmrDefaultFunctions.has(unwrapTsExpr(node.declaration)?.name)
+		) {
+			continue;
+		} else if (isComponentFunction(node)) {
 			// `function Foo() @{ ... }` (new TSRX shape) — non-exported helper. HMR
 			// doesn't wrap these (they're not user-visible across module boundaries).
 			bodyNodes.push(...compileComponent(node, ctx).nodes);
@@ -13295,6 +13640,7 @@ function compileInternal(
 			// (`const x = <style>…</style>`, exported or nested in a helper) become
 			// class-map objects and their sheets flow through cssInjections; scoped
 			// blocks inside plain functions' templates get their scope hashes.
+			const valueComponent = hmrValueComponents.get(node);
 			node = applyStyleScopes(node, ctx).node;
 			// HOOKS EVERYWHERE: a plain function (a custom hook, a helper) can hold
 			// octane hooks too — slot them the same way components do, so their base
@@ -13316,7 +13662,61 @@ function compileInternal(
 			const lowered = stampAnonymousDefaultFunctionLoc(rewriteModuleJsxValues(hooked, ctx), ctx);
 			// Top-level passthrough (imports, plain consts/functions): already a
 			// rewritten statement node — embedded directly in the module AST.
-			bodyNodes.push(lowered);
+			if (valueComponent !== undefined) {
+				const name = valueComponent.name;
+				const declaration =
+					lowered.type === 'ExportNamedDeclaration' ? lowered.declaration : lowered;
+				const [declarator] = declaration.declarations;
+				// A memo wrapper keeps its identity and comparator; HMR swaps the body it wraps.
+				const mutable = valueComponent.memo
+					? {
+							...declaration,
+							kind: 'let',
+							declarations: [
+								{
+									...declarator,
+									init: {
+										...declarator.init,
+										arguments: [
+											inheritOriginLoc(
+												b.call('_$hmr', declarator.init.arguments[0]),
+												declarator.init.arguments[0],
+											),
+										],
+									},
+								},
+							],
+						}
+					: { ...declaration, kind: 'let' };
+				bodyNodes.push(lowered === declaration ? mutable : { ...lowered, declaration: mutable });
+				if (!valueComponent.memo)
+					bodyNodes.push(
+						inheritOriginLoc(
+							b.stmt(b.assignment('=', b.id(name), b.call('_$hmr', b.id(name)))),
+							node,
+						),
+					);
+				hmrComponents.push({
+					name,
+					exportKind: valueComponent.exportKind,
+					memo: valueComponent.memo,
+				});
+			} else if (
+				node.type === 'ExportDefaultDeclaration' &&
+				unwrapTsExpr(node.declaration)?.type === 'Identifier' &&
+				hmrDefaultValues.has(unwrapTsExpr(node.declaration).name)
+			) {
+				// A live binding, so the handoff's rebinding reaches importers. An
+				// export specifier cannot carry an `as`/`satisfies` assertion.
+				bodyNodes.push(
+					inheritOriginLoc(
+						b.export(null, [b.export_specifier(unwrapTsExpr(node.declaration).name, 'default')]),
+						node,
+					),
+				);
+			} else {
+				bodyNodes.push(lowered);
+			}
 		}
 		if (ctx.typescriptWeb && node.leadingComments && bodyNodes.length > firstStatement) {
 			bodyNodes[firstStatement] = {
@@ -13430,6 +13830,7 @@ function compileInternal(
 			b.member(b.member(hot(), 'data'), b.id('__octaneComponents'), false, optional);
 		const previousComponent = (component) =>
 			b.member(componentStore(), b.id(componentKey(component)));
+		const hmrBody = (component, value) => (component.memo ? b.member(value, 'type') : value);
 		const handoffs = hmrComponents.map((c) =>
 			b.if(
 				// Newly added exports may be named constructor or __proto__; inherited
@@ -13448,8 +13849,8 @@ function compileInternal(
 						b.unary(
 							'!',
 							b.call(
-								b.member(b.member(previousComponent(c), b.id('_$HMR'), true), 'update'),
-								b.id(c.name),
+								b.member(b.member(hmrBody(c, previousComponent(c)), b.id('_$HMR'), true), 'update'),
+								hmrBody(c, b.id(c.name)),
 							),
 						),
 						b.block([b.stmt(b.call(b.member(hot(), 'invalidate')))]),
@@ -13723,7 +14124,7 @@ function compileInternal(
 	const program = {
 		type: 'Program',
 		sourceType: 'module',
-		body: [...runtimeImportNodes, ...profileRuntimeImportNodes, ...moduleBody],
+		body: [...directiveNodes, ...runtimeImportNodes, ...profileRuntimeImportNodes, ...moduleBody],
 		metadata: { path: [] },
 		start: ast.start,
 		end: ast.end,
@@ -13975,7 +14376,8 @@ function compileServer(
 	}
 	ctx.moduleCssInjections = ctx.cssInjections.slice();
 	const bodyNodes = emitServerModuleServerNodes(serverModuleInfo, ctx);
-	for (const node of ast.body) {
+	const directiveNodes = moduleDirectives(ast.body);
+	for (const node of ast.body.slice(directiveNodes.length)) {
 		const firstStatement = bodyNodes.length;
 		if (
 			node === serverModuleInfo?.declaration ||
@@ -14084,6 +14486,7 @@ function compileServer(
 		type: 'Program',
 		sourceType: 'module',
 		body: [
+			...directiveNodes,
 			...runtimeImportNodes,
 			...nativeActivation,
 			...signalActivation,
@@ -17935,7 +18338,8 @@ function compileComponent(node, ctx, options) {
 	const pendingWarm = ctx._pendingWarm;
 	ctx._pendingWarm = null;
 	const componentInfo = ctx.componentInfo.get(name);
-	const hydrationPlan = !ctx.hmr ? ctx.exportedHydrationPropsPlans?.get(name) : undefined;
+	const hydrationCandidate = !ctx.hmr ? ctx.hydrationPropsPlans?.get(name) : undefined;
+	const hydrationPlan = hydrationCandidate?.exported ? hydrationCandidate : undefined;
 	const memoCaptures = compilerMemoCaptures(ctx, componentInfo, name, isExported);
 	// Importers admit a cached region only for an export that carries a proof.
 	if (memoCaptures !== null) {
@@ -17948,6 +18352,14 @@ function compileComponent(node, ctx, options) {
 			component,
 			memoCaptures.length === 0 ? b.literal(null) : b.arrow([], b.array(memoCaptures)),
 		);
+	const presentationView =
+		node._octaneBindingView ??
+		(node._octanePresentationHydration?.fixed ? node._octanePresentationHydration : null);
+	// Fixed views need the identity stamp for composed handoff, but their SSR
+	// output has no authored range and may inherit the caller's boundary.
+	const presentationArgs = presentationView
+		? [b.literal(presentationView.id), ...(node._octaneBindingView ? [] : [b.literal(false)])]
+		: null;
 
 	// The compiled function stays a NODE (M2 AST emit): compileComponent returns
 	// `{ nodes }` — the declaration statement plus any capability-stamp/HMR/
@@ -18035,13 +18447,13 @@ function compileComponent(node, ctx, options) {
 			// back to a full reload — the capture predates the wrapper).
 			statements.push(guarded(b.assignment('=', b.id(name), b.call('_$hmr', b.id(name)))));
 		}
-		if (node._octaneBindingView) {
+		if (presentationArgs) {
 			statements.push(
 				guarded(
 					b.call(
 						requireRuntimeForContext(ctx, 'bindPresentationView'),
 						b.id(name),
-						b.literal(node._octaneBindingView.id),
+						...presentationArgs,
 					),
 				),
 			);
@@ -18077,13 +18489,13 @@ function compileComponent(node, ctx, options) {
 	// its fresh body to the previous canonical wrapper and re-export that same
 	// identity. Production components retain their tree-shakeable const binding.
 	let valueExpr = hmrWrap && isExported ? inheritOriginLoc(b.call('_$hmr', abiFn), node) : abiFn;
-	if (node._octaneBindingView) {
+	if (presentationArgs) {
 		valueExpr = markPure(
 			inheritOriginLoc(
 				b.call(
 					requireRuntimeForContext(ctx, 'bindPresentationView'),
 					valueExpr,
-					b.literal(node._octaneBindingView.id),
+					...presentationArgs,
 				),
 				node,
 			),
@@ -18133,6 +18545,29 @@ function compileComponent(node, ctx, options) {
 }
 
 /** Gate explicitly eligible presentation views; ordinary codegen stays direct. */
+// These fixed-view operations share the ordinary presentation frame without
+// retaining host, controlled-input, style, or native-projection dispatch.
+const FIXED_PRESENTATION_WRITERS = new Set([
+	'htext',
+	'hydrateClaimedBindingCaches',
+	'bindSignalAttribute',
+	'bindSignalText',
+	'setText',
+	'setRenderText',
+	'updateFreshClassName',
+	'updateFreshClassAttr',
+	...[
+		'setAttribute',
+		'setPlainAttribute',
+		'setURLAttribute',
+		'setStringData',
+		'setBooleanAttribute',
+		'setAriaAttribute',
+		'setClassName',
+		'setClassAttr',
+	].flatMap((name) => [name, `${name}IfChanged`]),
+]);
+
 function preparePresentationHydration(body, node, ctx, hostEnd) {
 	const proof = node._octanePresentationHydration;
 	if (!proof || ctx.mode === 'server' || ctx._universalRuntimeUnit != null) return body;
@@ -18163,6 +18598,10 @@ function preparePresentationHydration(body, node, ctx, hostEnd) {
 		writers.add('setRenderText');
 		writers.add('bindSignalText');
 		writers.add('markDangerouslySetInnerHTMLChildren');
+	}
+	if (proof.fixed) {
+		writers.add('htext');
+		writers.add('hydrateClaimedBindingCaches');
 	}
 	for (const name of [...writers]) {
 		if (name.startsWith('set')) writers.add(`${name}IfChanged`);
@@ -18269,7 +18708,12 @@ function preparePresentationHydration(body, node, ctx, hostEnd) {
 		return rewrite && writers.has(helper)
 			? inheritOriginLoc(
 					b.call(
-						requireRuntimeForContext(ctx, 'presentationWrite'),
+						requireRuntimeForContext(
+							ctx,
+							proof.fixed && FIXED_PRESENTATION_WRITERS.has(helper)
+								? 'presentationFixedWrite'
+								: 'presentationWrite',
+						),
 						result.callee,
 						b.literal(helper),
 						...result.arguments,
@@ -28790,6 +29234,7 @@ function planJsx(
 	const commit = !noTemplate && !ctx.presentationHydration ? makeCommitPlan() : null;
 	const BAG_LOCALS_PLACEHOLDER = `    /*__bagLocals__*/`;
 	if (!noTemplate) mountLines.push(BAG_LOCALS_PLACEHOLDER);
+	const BAG_FACTORY_PLACEHOLDER = `    /*__bagFactory__*/`;
 
 	let elementVars;
 	let ensureVar;
@@ -28931,6 +29376,8 @@ function planJsx(
 		}
 		// Template paths prove the node kind and presence; the runtime's generic
 		// navigation signatures cannot express that compile-time topology.
+		// sibling() steps once by default.
+		const siblingCount = (n) => (n === 1 ? [] : [b.literal(n)]);
 		const typedPath = (expression) =>
 			ctx.typescriptWeb ? b.ts_as(expression, b.ts_keyword_type('any')) : expression;
 		ensureVar = (path) => {
@@ -28967,7 +29414,7 @@ function planJsx(
 				// hydrating); raw `.nextSibling` for hole-free templates. sibVar already resolves to the
 				// (k−sibSteps)-th child, so n steps across lands on the k-th.
 				if (hasHoles) {
-					step = typedPath(b.call('_$sibling', b.id(sibVar), b.literal(sibSteps)));
+					step = typedPath(b.call('_$sibling', b.id(sibVar), ...siblingCount(sibSteps)));
 				} else {
 					step = b.id(sibVar);
 					for (let i = 0; i < sibSteps; i++) step = typedPath(b.member(step, 'nextSibling'));
@@ -28982,7 +29429,7 @@ function planJsx(
 				const parentVar = prefix.length === 0 ? '_root' : ensureVar(prefix);
 				if (hasHoles) {
 					step = typedPath(b.call('_$child', b.id(parentVar)));
-					if (k > 0) step = typedPath(b.call('_$sibling', step, b.literal(k)));
+					if (k > 0) step = typedPath(b.call('_$sibling', step, ...siblingCount(k)));
 				} else {
 					step = typedPath(b.member(b.id(parentVar), 'firstChild'));
 					for (let n = 0; n < k; n++) step = typedPath(b.member(step, 'nextSibling'));
@@ -29385,12 +29832,15 @@ function planJsx(
 					? constArgNode(f.constExpr)
 					: b.id(f.local);
 		const rootArg = () => (single ? b.id('_root') : b.literal(null));
-		if (bag.fields.length <= BAG_FACTORY_MAX) {
-			ctx.runtimeNeeded.add(`bag${bag.fields.length}`);
-			// The arity factory's object literal still declares every field, so an
-			// omitted trailing `undefined` seed keeps the same bag shape.
-			mountLines.push(
-				inheritOriginLoc(
+		const commits = commit !== null && commit.size() > 0;
+		ctx.runtimeNeeded.add(
+			bag.fields.length <= BAG_FACTORY_MAX ? `bag${bag.fields.length}` : 'bagOf',
+		);
+		const factoryLine = (commitName) => {
+			if (bag.fields.length <= BAG_FACTORY_MAX) {
+				// The arity factory's object literal still declares every field, so an
+				// omitted trailing `undefined` seed keeps the same bag shape.
+				return inheritOriginLoc(
 					b.stmt(
 						b.assignment(
 							'=',
@@ -29399,12 +29849,8 @@ function planJsx(
 								`_$bag${bag.fields.length}`,
 								b.id('__s'),
 								rootArg(),
-								...(commit !== null && commit.size() > 0
-									? [
-											...bag.fields.map(bagFieldValue),
-											b.literal(commit.size()),
-											b.id(commitFunctionName(ctx, commit)),
-										]
+								...(commits
+									? [...bag.fields.map(bagFieldValue), b.literal(commit.size()), b.id(commitName)]
 									: optionalCallArgs(
 											...bag.fields.map((f) =>
 												f.constExpr === 'undefined' ? null : bagFieldValue(f),
@@ -29414,44 +29860,39 @@ function planJsx(
 						),
 					),
 					planOrigin,
-				),
-			);
-		} else {
+				);
+			}
 			// Spill path — beyond the shared-factory arities: one inline literal
 			// (still real values, single allocation) through the generic commit.
-			ctx.runtimeNeeded.add('bagOf');
-			mountLines.push(
-				inheritOriginLoc(
-					b.stmt(
-						b.assignment(
-							'=',
-							b.id('_b'),
-							b.call(
-								'_$bagOf',
-								b.id('__s'),
-								rootArg(),
-								b.object([
-									...bag.fields.map((f) => b.prop('init', b.id(f.name), bagFieldValue(f))),
-									// The same state fields as the arity factories (see bagRecord).
-									b.prop('init', b.id('$'), b.literal(commit?.size() ?? 0)),
-									b.prop(
-										'init',
-										b.id('next'),
-										commit !== null && commit.size() > 0
-											? b.id(commitFunctionName(ctx, commit))
-											: b.literal(null),
-									),
-								]),
-								// The compiler owns this literal; opt into rehoming only
-								// when a field actually caches the block's DOM parent.
-								...(bag.hosts.has('__block.parentNode') ? [b.literal(1)] : []),
-							),
+			return inheritOriginLoc(
+				b.stmt(
+					b.assignment(
+						'=',
+						b.id('_b'),
+						b.call(
+							'_$bagOf',
+							b.id('__s'),
+							rootArg(),
+							b.object([
+								...bag.fields.map((f) => b.prop('init', b.id(f.name), bagFieldValue(f))),
+								// The same state fields as the arity factories (see bagRecord).
+								b.prop('init', b.id('$'), b.literal(commit?.size() ?? 0)),
+								b.prop('init', b.id('next'), commits ? b.id(commitName) : b.literal(null)),
+							]),
+							// The compiler owns this literal; opt into rehoming only
+							// when a field actually caches the block's DOM parent.
+							...(bag.hosts.has('__block.parentNode') ? [b.literal(1)] : []),
 						),
 					),
-					planOrigin,
 				),
+				planOrigin,
 			);
-		}
+		};
+		// A commit function is named once its body is known (emitCommitFunction).
+		if (commits) {
+			commit.factory = factoryLine;
+			mountLines.push(BAG_FACTORY_PLACEHOLDER);
+		} else mountLines.push(factoryLine(null));
 		// REF MANIFEST (compiled-output plan, ref-manifest phase): bodies with
 		// ref-carrying bindings stamp a module-scope constant on the scope so the
 		// runtime's suspense-hide walk (detachSubtreeRefs) finds the bag fields
@@ -29541,6 +29982,8 @@ function planJsx(
 	if (commit?.resumed)
 		updateLines.unshift(inheritOriginLoc(commitResumedDeclaration(), planOrigin));
 	const commitName = commit !== null ? emitCommitFunction(ctx, commit, planOrigin) : null;
+	if (commit?.factory)
+		mountLines[mountLines.indexOf(BAG_FACTORY_PLACEHOLDER)] = commit.factory(commitName);
 	if (ctx.scalarBindingClaims) {
 		// Only opted-in scalar views can retain another writer's publication at
 		// hydration. Record their existing cache fields; ordinary output is unchanged.
@@ -29627,7 +30070,7 @@ function planJsx(
 								b.let('_n', b.literal(null)),
 								commitResumedDeclaration(),
 								update,
-								commitDoneStatement(ctx, commitName, planOrigin),
+								commitDoneStatement(ctx, planOrigin),
 							]),
 							planOrigin,
 						)
@@ -30491,11 +30934,7 @@ function planJsx(
 		// this compiled scope; the ordinary component runtime never sees memo deps.
 		if (cc.autoMemoDeps !== null) {
 			const liteMemo = cc.autoMemoLite === true && !cc.inheritRange;
-			const componentHelper = liteMemo
-				? 'componentSlotLite'
-				: cc.voidComponent
-					? 'componentSlotVoid'
-					: 'componentSlot';
+			const componentHelper = liteMemo ? 'componentSlotLite' : componentSlotHelper(cc);
 			const memoAnchor = liteMemo
 				? slotAnchorNodeFor(cc, 'compAnchor')
 				: anchorNodeFor(cc, 'compAnchor');
@@ -30557,8 +30996,9 @@ function planJsx(
 		// when the borrow is declined (incoherent parent regime) and the probe
 		// anchor for transition swaps.
 		if (cc.inheritRange) {
-			const componentHelper = cc.voidComponent ? '_$componentSlotVoid' : '_$componentSlot';
-			ctx.runtimeNeeded.add(cc.voidComponent ? 'componentSlotVoid' : 'componentSlot');
+			const helper = componentSlotHelper(cc);
+			const componentHelper = rtAlias(helper);
+			ctx.runtimeNeeded.add(helper);
 			pushAfterStmt(cc.id, org, {
 				...b.stmt(
 					b.call(
@@ -30606,7 +31046,7 @@ function planJsx(
 			});
 			continue;
 		}
-		const componentHelper = cc.voidComponent ? 'componentSlotVoid' : 'componentSlot';
+		const componentHelper = componentSlotHelper(cc);
 		// Anchor selection — see anchorNodeFor (the endMarker case keeps the
 		// slot's markers inside the block's range so for-of reorder / tryBlock
 		// unmount move the slot DOM along with the block; an element host with
@@ -30644,7 +31084,7 @@ function planJsx(
 	if (holes.length !== 0) {
 		// After the last hole: commit or queue what the holes recorded.
 		const last = holes.reduce((latest, cc) => (cc.id > latest.id ? cc : latest));
-		pushAfterStmt(last.id, planOrigin, commitDoneStatement(ctx, commitName, planOrigin));
+		pushAfterStmt(last.id, planOrigin, commitDoneStatement(ctx, planOrigin));
 	}
 	for (const pc of ctx._portalCalls) {
 		const slotIndex = pc.slotIndex;
@@ -30719,6 +31159,7 @@ function planJsx(
 		if (!catchOnly && (tc.propagateSuspense || tc.hydrationInputsEqual))
 			trailing.push(b.literal(tc.propagateSuspense === true));
 		if (tc.hydrationInputsEqual) trailing.push(b.id(tc.hydrationInputsEqual));
+		if (tc.preserveHydrationCapture) trailing.push(tc.preserveHydrationCapture);
 		const boundaryArgs = [
 			b.id('__s'),
 			b.literal(slotIndex),
@@ -30802,10 +31243,7 @@ function planJsx(
 		everyRender:
 			commitName === null || bindingCells === 0
 				? everyRenderLines
-				: [
-						...everyRenderLines,
-						commitDoneStatement(ctx, commitName, planOrigin, holes.length !== 0),
-					],
+				: [...everyRenderLines, commitDoneStatement(ctx, planOrigin, holes.length !== 0)],
 		commitCells: commitName !== null,
 		after: afterStatements,
 		head: headEmit.head,
@@ -30975,13 +31413,23 @@ const nullNode = () => b.literal(null);
 // undefined. Pass `null` for an absent entry: trailing absent entries are
 // omitted and interior ones become explicit `undefined` placeholders. Only use
 // it for writers that never inspect `arguments.length` (bindSignalText does).
-// componentSlot, componentSlotVoid, and componentSlotLite order their tail after
+// componentSlot, its void and function entries, and componentSlotLite order their tail after
 // `props` by how often a call site supplies it — (invocationSite, anchor,
 // singleRoot, inherit, key, hasKey) — so the common call keeps two of the six.
 function optionalCallArgs(...entries) {
 	let end = entries.length;
 	while (end > 0 && entries[end - 1] == null) end--;
 	return entries.slice(0, end).map((entry) => entry ?? undefinedNode());
+}
+
+// A full component slot's writer: void bodies skip return reconciliation, and
+// proven function tags skip the dynamic host-tag capability.
+function componentSlotHelper(call) {
+	return call.voidComponent
+		? 'componentSlotVoid'
+		: call.functionComponent
+			? 'componentSlotFunction'
+			: 'componentSlot';
 }
 
 // Preserve each selected writer and its first seven arguments. Longer tails
@@ -30991,7 +31439,9 @@ function hydrationComponentInvocation(ctx, call, helper, args) {
 	ctx.runtimeNeeded.add(helper);
 	if (
 		!call.hydrationInput ||
-		(helper !== 'componentSlot' && helper !== 'componentSlotVoid') ||
+		(helper !== 'componentSlot' &&
+			helper !== 'componentSlotVoid' &&
+			helper !== 'componentSlotFunction') ||
 		args.length > 7 ||
 		call.bindingSite
 	) {
@@ -31802,8 +32252,10 @@ function emitBindingMount(bind, elVar, bag) {
 // The template's hoisted commit function walks the cells straight-line, writes
 // each changed one through the ordinary setter, then publishes it:
 //
-//   function _c$7(_b) { const _n = _b.next; let _v; _b.$ &= 255;
+//   function _c$7(_b, _n) { let _v;
 //     if ((_v = _n[3]) !== _b) { _$setText(_b.f, _v); _b.g = _v; } … }
+//
+// Its caller clears the bag's staged state and passes the cells (`_n`).
 //
 // Handler slots and bundles are written in place unless the runtime passes
 // `careful` (`_f`: an open journal or a dispatch in flight). The bag factory
@@ -31844,8 +32296,8 @@ function makeCommitPlan() {
 			size = 0;
 			writes = [];
 		},
-		/** The commit function's name, allocated by commitFunctionName. */
-		name: null,
+		/** Builds the bag factory call once the commit function is named. */
+		factory: null,
 		/** A write takes the commit function's `careful` parameter (`_f`). */
 		careful: false,
 		/** An update binding compares inline, so the update branch declares `_r`. */
@@ -31908,27 +32360,27 @@ function commitCellCount(bind) {
 	return bind.kind === 'styleProperties' ? bind.properties.length : 1;
 }
 
-/** The template's commit function, named once its bag factory needs it. */
-function commitFunctionName(ctx, commit) {
-	commit.name ??= allocCompilerName(ctx, `_c$${ctx.nextHelperId++}`);
-	return commit.name;
-}
-
+/**
+ * The template's commit function. A production build shares byte-identical
+ * ones, as allocTemplate interns templates; dev, HMR and profile builds keep
+ * one per template, so each debugs and maps to its own component.
+ */
 function emitCommitFunction(ctx, commit, origin) {
 	const writes = commit.writes();
-	if (writes.length === 0 && commit.name === null) return null;
-	const name = commitFunctionName(ctx, commit);
+	if (writes.length === 0 && commit.factory === null) return null;
 	const cells = [];
 	for (const make of writes) if (make !== undefined) cells.push(make(commit.size()));
-	const body = [
-		b.const('_n', b.member(b.id('_b'), 'next')),
-		b.declaration('let', [b.declarator('_v')]),
-		// Clear the staged state first: a setter that throws leaves the bag idle,
-		// its committed slots still describing the DOM.
-		b.stmt(b.assignment('&=', b.member(b.id('_b'), '$'), b.literal(COMMIT_MAX_CELLS))),
-		...cells,
-	];
-	const params = commit.careful ? [b.id('_b'), b.id('_f')] : [b.id('_b')];
+	const body = [b.declaration('let', [b.declarator('_v')]), ...cells];
+	const params = [b.id('_b'), b.id('_n'), ...(commit.careful ? [b.id('_f')] : [])];
+	const share = !ctx.hmr && !ctx.dev && !ctx.profile;
+	const key = share ? astStructuralKey([params, body]) : null;
+	const shared = share ? ctx.commitFunctions.get(key) : undefined;
+	if (shared !== undefined) {
+		if (ctx.inspect) aliasSharedOrigins(ctx, body, shared.body, new Set());
+		return shared.name;
+	}
+	const name = allocCompilerName(ctx, `_c$${ctx.nextHelperId++}`);
+	if (share) ctx.commitFunctions.set(key, { name, body });
 	// A body without its own origin (a helper's) takes its first binding's.
 	ctx.hoistedHelpers.push(
 		inheritOriginLoc(
@@ -31937,6 +32389,28 @@ function emitCommitFunction(ctx, commit, origin) {
 		),
 	);
 	return name;
+}
+
+/**
+ * A shared commit function emits only its first template's bindings: alias each
+ * later one onto the node it shares, so inspection still reaches its code. The
+ * two trees match node for node (their structural keys are equal).
+ */
+function aliasSharedOrigins(ctx, copy, canonical, seen) {
+	if (copy === null || typeof copy !== 'object') return;
+	if (Array.isArray(copy)) {
+		for (let i = 0; i < copy.length; i++) aliasSharedOrigins(ctx, copy[i], canonical[i], seen);
+		return;
+	}
+	if (typeof copy.type === 'string' && copy.start != null && canonical.start != null) {
+		const pair = `${copy.start}:${copy.end}:${canonical.start}`;
+		if (!seen.has(pair)) {
+			seen.add(pair);
+			registerOriginAlias(ctx, copy, canonical);
+		}
+	}
+	for (const key of Object.keys(copy))
+		if (!AST_STRUCTURAL_KEY_SKIP.has(key)) aliasSharedOrigins(ctx, copy[key], canonical[key], seen);
 }
 
 /** `_r`: an earlier render of this transaction staged the bag (see bagRecord). */
@@ -31954,9 +32428,9 @@ function commitOwnersDeclaration(ctx) {
 // under 512) commits or queues it here. `reset` when holes record after it: a
 // bag its commit function already wrote (back under 256) stages afresh; a
 // queued one keeps its cells.
-function commitDoneStatement(ctx, name, origin, reset = false) {
+function commitDoneStatement(ctx, origin, reset = false) {
 	ctx.runtimeNeeded.add('bagDone');
-	const done = b.stmt(b.call('_$bagDone', b.id('__s'), b.id('_b'), b.id(name)));
+	const done = b.stmt(b.call('_$bagDone', b.id('__s'), b.id('_b')));
 	return inheritOriginLoc(
 		b.if(
 			b.logical(
@@ -35468,7 +35942,15 @@ function isCheckedCompiledBoundary(node, ctx) {
 		local = tag.object;
 		imported = tag.property.name;
 	}
-	if (imported !== 'CompiledOutlet' && imported !== 'CompiledContext') return false;
+	// Octane's own boundaries render their output imperatively and return
+	// nothing, whatever children or fallback they receive.
+	if (
+		imported !== 'CompiledOutlet' &&
+		imported !== 'CompiledContext' &&
+		imported !== 'Suspense' &&
+		imported !== 'ViewTransition'
+	)
+		return false;
 	if (ctx.currentComponentLocals?.has(local.name)) return false;
 	const binding = activityReferenceBinding(local, node, ctx);
 	return binding?.importSource?.value === 'octane';
@@ -35882,6 +36364,37 @@ function isImmutableComponentTag(tag, ctx) {
 	);
 }
 
+// A module `const` initialized by Octane's `lazy()` always holds the lazy
+// wrapper, a function, so its call sites never resolve a host string at runtime
+// and can skip the generic entry's dynamic-tag capability.
+function isLazyComponentTag(tag, ctx) {
+	if (tag?.type !== 'JSXIdentifier' && tag?.type !== 'Identifier') return false;
+	const lexical = (ctx.activityLexical ??= createLexicalAnalysis(ctx.activityModuleAst));
+	const scope = lexical.nodeScopes.get(tag);
+	if (scope === undefined || lexical.resolveBinding(scope, tag.name)?.scope !== lexical.rootScope)
+		return false;
+	ctx.lazyComponentBindings ??= collectLazyComponentBindings(ctx, lexical);
+	return ctx.lazyComponentBindings.has(tag.name);
+}
+
+function collectLazyComponentBindings(ctx, lexical) {
+	const names = new Set();
+	for (const statement of ctx.activityModuleAst.body) {
+		const declaration =
+			statement.type === 'ExportNamedDeclaration' ? statement.declaration : statement;
+		if (declaration?.type !== 'VariableDeclaration' || declaration.kind !== 'const') continue;
+		for (const item of declaration.declarations) {
+			const callee = item.init?.type === 'CallExpression' ? item.init.callee : null;
+			if (item.id.type !== 'Identifier' || callee?.type !== 'Identifier') continue;
+			if (ctx.octaneImportLocals?.get(callee.name) !== 'lazy') continue;
+			const binding = lexical.resolveBinding(lexical.nodeScopes.get(callee), callee.name);
+			if (binding?.scope === lexical.rootScope && binding.importSource?.value === 'octane')
+				names.add(item.id.name);
+		}
+	}
+	return names;
+}
+
 function isCompiledHydrateTemplate(node, ctx, attrs) {
 	if (!ctx.compiledHydrateTemplates || ctx._universalRuntimeUnit != null) return false;
 	const tag = node.openingElement?.name ?? node.id;
@@ -36158,7 +36671,7 @@ function makeCompCall(
 		};
 	}
 	const localHydrationPlan =
-		staticFragmentRenderer === undefined ? exportedHydrationPropsPlan(ctx, compName) : null;
+		staticFragmentRenderer === undefined ? hydrationPropsPlan(ctx, compName) : null;
 
 	// Design (c) v0: decide whether the call site can use componentSlotLite
 	// (Scope-only, no Block / no Comment markers / no CompSlot wrapper).
@@ -36452,6 +36965,8 @@ function makeCompCall(
 		autoMemoLite: node._octaneBindingSite ? false : autoMemoLite,
 		autoMemoPublicationWitnesses,
 		voidComponent,
+		functionComponent:
+			!voidComponent && isLazyComponentTag(node.openingElement?.name ?? node.id, ctx),
 		singleRoot: node._octaneBindingSite ? false : singleRoot,
 		maybeSingleRoot: node._octaneBindingSite ? false : maybeSingleRoot,
 		loc: devLoc(ctx, node),
@@ -36509,14 +37024,15 @@ function hoistHydrationInputPlan(ctx, fields, required, origin) {
 	const methods = [...fields].filter(([, read]) => !read).map(([field]) => field);
 	const ordinary = [...required].filter((field) => fields.get(field) !== false);
 	const name = allocCompilerName(ctx, '__hydrationInputPlan');
+	const values = b.array([
+		b.literal(methods.length),
+		...methods.concat(ordinary).map((field) => b.literal(field)),
+	]);
 	ctx.hoistedHelpers.push(
 		inheritOriginLoc(
 			b.const(
 				name,
-				b.array([
-					b.literal(methods.length),
-					...methods.concat(ordinary).map((field) => b.literal(field)),
-				]),
+				ctx.typescriptWeb ? b.ts_as(values, b.ts_type_reference(b.id('const'))) : values,
 			),
 			origin,
 		),
@@ -36534,7 +37050,8 @@ function hoistHydrationInputsEqual(ctx, bodies, envNames, origin, componentName)
 	const propsName = component.params?.[0]?.name;
 	const propsIndex = envNames.indexOf(propsName);
 	if (propsIndex < 0) return null;
-	const plan = exportedHydrationPropsPlan(ctx, componentName);
+	const plan = hydrationPropsPlan(ctx, componentName);
+	if (plan?.query?.guard && !envNames.includes(plan.query.guard.name)) return null;
 	const derivedIndex = plan?.derived ? envNames.indexOf(plan.derived.name) : -1;
 	if (plan?.derived && derivedIndex < 0) return null;
 	let fields = plan?.fields;
@@ -36602,9 +37119,37 @@ function hoistHydrationInputsEqual(ctx, bodies, envNames, origin, componentName)
 			),
 		),
 	]);
-	const terms = [b.logical('||', ordinary, refined)];
+	// A numeric result asks the renderer to validate the original query wake.
+	// Ordinary identity equality still uses the existing hydration path.
+	const acceptedRefinement = plan?.query ? b.logical('&&', refined, b.literal(2)) : refined;
+	const inputTerm = capture?.source
+		? b.conditional(
+				ordinary,
+				b.call(
+					requireRuntimeForContext(ctx, '__sameHydrationSource'),
+					b.id('previous'),
+					b.id(capture.source),
+				),
+				refined,
+			)
+		: b.logical('||', ordinary, acceptedRefinement);
+	const terms = plan?.optional || capture?.source || plan?.query ? [] : [inputTerm];
 	for (let index = 0; index < envNames.length; index++)
 		if (index !== propsIndex && index !== derivedIndex) terms.push(sameSlot(index));
+	// Arming the next actual access is the final comparator operation, including
+	// when the component reuses its previous props record.
+	if (plan?.optional)
+		terms.push(
+			inputTerm,
+			b.call(
+				requireRuntimeForContext(ctx, '__sameHydrationOptionalInput'),
+				b.id('previous'),
+				b.id('next'),
+				slot('next', propsIndex),
+				b.literal(plan.optional.field),
+			),
+		);
+	else if (capture?.source || plan?.query) terms.push(inputTerm);
 	const name = allocCompilerName(ctx, '__hydrationInputsEqual');
 	ctx.hoistedHelpers.push(
 		inheritOriginLoc(
@@ -36616,7 +37161,7 @@ function hoistHydrationInputsEqual(ctx, bodies, envNames, origin, componentName)
 			origin,
 		),
 	);
-	return { name, capture };
+	return { name, capture, optional: plan?.optional, query: plan?.query };
 }
 
 function tryBodies(node, ctx) {
@@ -36695,13 +37240,64 @@ function makeTryCall(
 	componentName = null,
 ) {
 	const bodies = tryBodies(node, ctx);
-	const tryStmts = bodies[0].stmts;
+	let tryStmts = bodies[0].stmts;
 	const pendingStmts = bodies[1]?.stmts;
 	const catchBodyStmts = bodies[2]?.stmts;
 	const catchParams = bodies[2]?.params;
 	const envNames = unionEnv(ctx, bodies);
 	const hydrationInputsEqual =
 		pendingStmts && hoistHydrationInputsEqual(ctx, bodies, envNames, node, componentName);
+	if (hydrationInputsEqual?.optional) {
+		const { propsName, field } = hydrationInputsEqual.optional;
+		const call = b.call(
+			requireRuntimeForContext(ctx, '__observeHydrationOptionalInput'),
+			b.id('__extra'),
+			b.id(propsName),
+			b.literal(field),
+		);
+		tryStmts = replaceHydrationFirstOptionalReader(
+			bodies[0],
+			b.sequence([call, tryStmts[0].declarations[0].init.left]),
+		).stmts;
+	}
+	if (hydrationInputsEqual?.query) {
+		// Observe only this authored read: a later read can throw the same query
+		// waiter after this one returned through a different adoption frame.
+		const first = tryStmts[0];
+		const declaration = first.declarations[0];
+		const initializer = unwrapTsExpr(declaration.init);
+		const branch = hydrationInputsEqual.query.guard === null ? initializer : initializer.consequent;
+		const authoredRead = unwrapTsExpr(branch);
+		const read = allocCompilerName(ctx, '__queryRead');
+		ctx.hoistedHelpers.push(
+			inheritOriginLoc(b.const(read, b.arrow([], authoredRead)), authoredRead),
+		);
+		const observedRead = replaceTsInner(
+			branch,
+			authoredRead,
+			b.call(
+				requireRuntimeForContext(ctx, '__readHydrationQueryInput'),
+				b.id('__extra'),
+				b.id(read),
+			),
+		);
+		tryStmts = [
+			{
+				...first,
+				declarations: [
+					{
+						...declaration,
+						init: replaceTsInner(
+							declaration.init,
+							initializer,
+							branch === initializer ? observedRead : { ...initializer, consequent: observedRead },
+						),
+					},
+				],
+			},
+			...tryStmts.slice(1),
+		];
+	}
 
 	const tryHelperName = hoistBodyHelper(
 		ctx,
@@ -36744,6 +37340,32 @@ function makeTryCall(
 			node.handlerKeyword ?? null,
 		);
 	}
+	// Match tryBlock's private capture modes; decline overlapping proofs.
+	let preserveHydrationCapture = null;
+	if (hydrationInputsEqual?.query) {
+		const queryCapture = allocCompilerName(ctx, '__hydrationQuery');
+		const env = allocCompilerName(ctx, '__queryEnv');
+		preserveHydrationCapture = b.id(queryCapture);
+		ctx.hoistedHelpers.push(
+			inheritOriginLoc(
+				b.const(
+					queryCapture,
+					b.arrow(
+						[b.id(env)],
+						b.call(
+							requireRuntimeForContext(ctx, '__beginHydrationQueryRead'),
+							b.id(env),
+							b.arrow([], { ...hydrationInputsEqual.query.receiver }),
+						),
+					),
+				),
+				node,
+			),
+		);
+	} else if (hydrationInputsEqual?.optional && !hydrationInputsEqual.capture?.source)
+		preserveHydrationCapture = b.literal(1);
+	else if (!hydrationInputsEqual?.optional && hydrationInputsEqual?.capture?.source)
+		preserveHydrationCapture = b.literal(2);
 	return {
 		id: ctx.nextHelperId++,
 		loc: devLoc(ctx, node),
@@ -36751,6 +37373,7 @@ function makeTryCall(
 		envNames,
 		hydrationInputsEqual: hydrationInputsEqual?.name,
 		hydrationInputCapture: hydrationInputsEqual?.capture,
+		preserveHydrationCapture,
 		tryHelper: tryHelperName,
 		catchHelper: catchHelperName,
 		pendingHelper: pendingHelperName,

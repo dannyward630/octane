@@ -1,10 +1,23 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mount, flushEffects } from './_helpers';
-import { flushSync, setFormAction, startTransition } from '../src/index.js';
+import { act, mount, flushEffects } from './_helpers';
+import {
+	flushSync,
+	getTransitionFallbackTimeout,
+	setFormAction,
+	setTransitionFallbackTimeout,
+	startTransition,
+} from '../src/index.js';
 import {
 	ActionForm,
 	SubmitterActionForm,
 	FormWithStatus,
+	CommittedWrapperFrontierPortaledFormWithStatus,
+	FrontierPortaledFormWithStatus,
+	FrontierInnerFormPortaledFormWithStatus,
+	FrontierWrappedInnerFormPortaledFormWithStatus,
+	NestedFrontierPortaledFormWithStatus,
+	NestedPortaledFormWithStatus,
+	PortaledFormWithStatus,
 	RawFormWithStatus,
 	StatusProbe,
 	SelfFormStatus,
@@ -12,6 +25,9 @@ import {
 	OptimisticForm,
 	BareOptimistic,
 	OptimisticCounter,
+	OptimisticSuspenseAction,
+	SuspendedTransitionRoot,
+	OptimisticSupersededTransition,
 	DirectAction,
 	ExposedDispatch,
 	RawForm,
@@ -27,6 +43,21 @@ function deferred<T = void>() {
 		reject = rej;
 	});
 	return { promise, resolve, reject };
+}
+
+function suspenseGate() {
+	const gate = deferred();
+	let ready = false;
+	return {
+		read: () => {
+			if (!ready) throw gate.promise;
+			return 'ready';
+		},
+		resolve: () => {
+			ready = true;
+			gate.resolve();
+		},
+	};
 }
 
 // Commit a microtask's worth of scheduled (transition-priority) work — used to
@@ -243,6 +274,311 @@ describe('useFormStatus', () => {
 		r.unmount();
 	});
 
+	it('reports the logical ancestor form’s pending status through a portal', async () => {
+		const d = deferred();
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(PortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form');
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+			expect(button.getAttribute('data-scope')).toBe('owned');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => (form as HTMLFormElement).requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+			expect(button.disabled).toBe(true);
+			expect(button.getAttribute('data-scope')).toBe('owned');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('resolves a portaled form status when its source wrapper is still in a frontier', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(FrontierPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form') as HTMLFormElement;
+			expect(target.querySelector('#portal-status')).toBeNull();
+
+			// The form is already committed; the new wrapper and its portal mount
+			// together through a detached frontier on this update.
+			flushSync(() => showPortal());
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+			expect(button.getAttribute('data-scope')).toBe('frontier');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+			expect(button.disabled).toBe(true);
+			expect(button.getAttribute('data-scope')).toBe('frontier');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+			expect(button.disabled).toBe(false);
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('finds the source form through a committed wrapper around a frontier portal', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(CommittedWrapperFrontierPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form') as HTMLFormElement;
+			flushSync(() => showPortal());
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.getAttribute('data-scope')).toBe('committed-wrapper');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('does not use an outer portal target form as the logical ancestor', async () => {
+		const d = deferred();
+		let submittedDraft: FormDataEntryValue | null = null;
+		const outerTarget = document.createElement('aside');
+		const innerTarget = document.createElement('form');
+		innerTarget.id = 'other-form';
+		document.body.append(outerTarget, innerTarget);
+		const r = mount(NestedPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			outerTarget,
+			innerTarget,
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form') as HTMLFormElement;
+			const button = innerTarget.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.getAttribute('data-scope')).toBe('nested');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			outerTarget.remove();
+			innerTarget.remove();
+		}
+	});
+
+	it('crosses a committed parent portal before resolving a nested frontier portal', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const outerTarget = document.createElement('form');
+		outerTarget.id = 'other-form';
+		const innerTarget = document.createElement('aside');
+		document.body.append(outerTarget, innerTarget);
+		const r = mount(NestedFrontierPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			outerTarget,
+			innerTarget,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const form = r.find('#save-form') as HTMLFormElement;
+			expect(outerTarget.querySelector('#outer-portal-host')).not.toBeNull();
+			expect(innerTarget.querySelector('#portal-status')).toBeNull();
+
+			flushSync(() => showPortal());
+			const button = innerTarget.querySelector('#portal-status') as HTMLButtonElement;
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.getAttribute('data-scope')).toBe('nested-frontier');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			outerTarget.remove();
+			innerTarget.remove();
+		}
+	});
+
+	it('uses a nearer form root that is still inside the source frontier', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(FrontierInnerFormPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const outerForm = r.find('#outer-form') as HTMLFormElement;
+			expect(r.container.querySelector('#save-form')).toBeNull();
+
+			flushSync(() => showPortal());
+			const form = r.find('#save-form') as HTMLFormElement;
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(outerForm.contains(form)).toBe(true);
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.getAttribute('data-scope')).toBe('frontier-inner-form');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('walks the detached host before falling back past a wrapper form', async () => {
+		const d = deferred();
+		let showPortal!: () => void;
+		let submittedDraft: FormDataEntryValue | null = null;
+		const target = document.createElement('aside');
+		document.body.appendChild(target);
+		const r = mount(FrontierWrappedInnerFormPortaledFormWithStatus, {
+			action: (data: FormData) => {
+				submittedDraft = data.get('draft');
+				return d.promise;
+			},
+			target,
+			expose: (show: () => void) => (showPortal = show),
+		});
+		try {
+			flushSync(() => {});
+			const outerForm = r.find('#outer-form') as HTMLFormElement;
+			expect(r.container.querySelector('#save-form')).toBeNull();
+
+			flushSync(() => showPortal());
+			const form = r.find('#save-form') as HTMLFormElement;
+			const button = target.querySelector('#portal-status') as HTMLButtonElement;
+			expect(outerForm.contains(form)).toBe(true);
+			expect(button.form).toBe(form);
+			expect(button.textContent).toBe('idle');
+			expect(button.getAttribute('data-scope')).toBe('wrapped-frontier-inner-form');
+
+			(r.find('#field') as HTMLInputElement).value = 'edited';
+			flushSync(() => form.requestSubmit(button));
+			await tick();
+			expect(submittedDraft).toBe('edited');
+			expect(button.textContent).toBe('pending:edited');
+
+			d.resolve();
+			await settle();
+			expect(button.textContent).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
 	it('keeps the form pending until ALL queued submits drain', async () => {
 		// useActionState runs dispatches sequentially; each dispatch's promise
 		// resolves when THAT action finishes, not when the whole queue drains. A
@@ -351,6 +687,174 @@ describe('useFormStatus', () => {
 });
 
 describe('useOptimistic', () => {
+	it('keeps optimistic state through a Suspense hold owned by its action', async () => {
+		const save = deferred();
+		const detail = suspenseGate();
+		const r = mount(OptimisticSuspenseAction, {
+			save: save.promise,
+			read: detail.read,
+			suspend: true,
+		});
+		try {
+			flushSync(() => (r.find('#save') as HTMLButtonElement).click());
+			await tick();
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+			flushSync(() => (r.find('#bare-add') as HTMLButtonElement).click());
+			await tick();
+			expect(r.find('#optimistic').textContent).toBe('1');
+
+			save.resolve();
+			await settle();
+			expect(r.find('#saved').textContent).toBe('0');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+			expect(r.find('#detail').textContent).toBe('old');
+
+			detail.resolve();
+			await settle();
+			expect(r.find('#saved').textContent).toBe('1');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('idle');
+			expect(r.find('#detail').textContent).toBe('ready');
+		} finally {
+			save.resolve();
+			detail.resolve();
+			await settle();
+			r.unmount();
+		}
+	});
+
+	it('reverts its optimistic state while an unrelated root stays suspended', async () => {
+		const save = deferred();
+		const detail = suspenseGate();
+		const unrelated = mount(SuspendedTransitionRoot, { read: detail.read });
+		const r = mount(OptimisticSuspenseAction, {
+			save: save.promise,
+			read: detail.read,
+			suspend: false,
+		});
+		try {
+			flushSync(() => (unrelated.find('#navigate') as HTMLButtonElement).click());
+			await settle();
+			expect(unrelated.find('#pending').textContent).toBe('pending');
+			expect(unrelated.find('#detail').textContent).toBe('old');
+
+			flushSync(() => (r.find('#save') as HTMLButtonElement).click());
+			await tick();
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+
+			save.resolve();
+			await settle();
+			expect(r.find('#saved').textContent).toBe('1');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('idle');
+			expect(unrelated.find('#pending').textContent).toBe('pending');
+
+			detail.resolve();
+			await settle();
+			expect(unrelated.find('#pending').textContent).toBe('idle');
+			expect(unrelated.find('#detail').textContent).toBe('ready');
+		} finally {
+			save.resolve();
+			detail.resolve();
+			await settle();
+			r.unmount();
+			unrelated.unmount();
+		}
+	});
+
+	for (const urgentFirst of [false, true]) {
+		it(`reverts with the held work a timeout fallback lets commit (urgentFirst=${urgentFirst})`, async () => {
+			vi.useFakeTimers({ shouldAdvanceTime: false });
+			const previousTimeout = getTransitionFallbackTimeout();
+			setTransitionFallbackTimeout(100);
+			const save = deferred();
+			const detail = suspenseGate();
+			const r = mount(OptimisticSuspenseAction, {
+				save: save.promise,
+				read: detail.read,
+				suspend: true,
+			});
+			try {
+				r.click('#save');
+				await act(async () => {
+					save.resolve();
+					await save.promise;
+				});
+				expect(r.find('#saved').textContent).toBe('0');
+				expect(r.find('#optimistic').textContent).toBe('1');
+
+				if (urgentFirst) {
+					// An urgent render folds the released work before its retry task.
+					vi.advanceTimersByTime(100);
+				} else await act(() => vi.advanceTimersByTimeAsync(100));
+				expect(r.find('#fallback').textContent).toBe('loading');
+				expect(r.find('#pending').textContent).toBe('pending');
+
+				r.click('#bare-add');
+				expect(r.find('#saved').textContent).toBe('1');
+				expect(r.find('#optimistic').textContent).toBe('11');
+				await act(() => {});
+				expect(r.find('#saved').textContent).toBe('1');
+				expect(r.find('#optimistic').textContent).toBe('1');
+				expect(r.find('#pending').textContent).toBe('pending');
+
+				await act(async () => {
+					detail.resolve();
+				});
+				expect(r.find('#detail').textContent).toBe('ready');
+				expect(r.find('#optimistic').textContent).toBe('1');
+				expect(r.find('#pending').textContent).toBe('idle');
+			} finally {
+				save.resolve();
+				detail.resolve();
+				await act(() => {});
+				r.unmount();
+				setTransitionFallbackTimeout(previousTimeout);
+				vi.useRealTimers();
+			}
+		});
+	}
+
+	it('reverts without a cross-render warning when an urgent update supersedes its transition', async () => {
+		const fulfilled = (value: string) =>
+			Object.assign(Promise.resolve(value), { status: 'fulfilled', value });
+		const next = deferred<string>();
+		const r = mount(OptimisticSupersededTransition, {
+			initial: fulfilled('A'),
+			next: next.promise,
+			urgent: fulfilled('C'),
+		});
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			flushSync(() => (r.find('#transition') as HTMLButtonElement).click());
+			await settle();
+			expect(r.find('#value').textContent).toBe('A');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+
+			flushSync(() => (r.find('#urgent') as HTMLButtonElement).click());
+			await settle();
+			expect(r.find('#value').textContent).toBe('C');
+			// The superseded transition's retry finishes its batch in a task.
+			await act(() => {});
+			expect(r.find('#optimistic').textContent).toBe('0');
+			expect(r.find('#pending').textContent).toBe('idle');
+			expect(
+				error.mock.calls.filter(([message]) =>
+					String(message).includes('Cannot update a component'),
+				),
+			).toEqual([]);
+		} finally {
+			error.mockRestore();
+			next.resolve('B');
+			await settle();
+			r.unmount();
+		}
+	});
+
 	it('shows the optimistic value during the action, then converges to real state', async () => {
 		const d = deferred();
 		const r = mount(OptimisticForm, { initial: ['x'], action: () => d.promise });
