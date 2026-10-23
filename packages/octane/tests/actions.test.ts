@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { act, mount, flushEffects } from './_helpers';
-import { flushSync, setFormAction, startTransition } from '../src/index.js';
+import {
+	flushSync,
+	getTransitionFallbackTimeout,
+	setFormAction,
+	setTransitionFallbackTimeout,
+	startTransition,
+} from '../src/index.js';
 import {
 	ActionForm,
 	SubmitterActionForm,
@@ -756,6 +762,53 @@ describe('useOptimistic', () => {
 			await settle();
 			r.unmount();
 			unrelated.unmount();
+		}
+	});
+
+	it('reverts with the held work a timeout fallback lets commit', async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: false });
+		const previousTimeout = getTransitionFallbackTimeout();
+		setTransitionFallbackTimeout(100);
+		const save = deferred();
+		const detail = suspenseGate();
+		const r = mount(OptimisticSuspenseAction, {
+			save: save.promise,
+			read: detail.read,
+			suspend: true,
+		});
+		try {
+			r.click('#save');
+			await act(async () => {
+				save.resolve();
+				await save.promise;
+			});
+			expect(r.find('#saved').textContent).toBe('0');
+			expect(r.find('#optimistic').textContent).toBe('1');
+
+			await act(() => vi.advanceTimersByTimeAsync(100));
+			expect(r.find('#fallback').textContent).toBe('loading');
+			expect(r.find('#saved').textContent).toBe('1');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+
+			r.click('#bare-add');
+			expect(r.find('#optimistic').textContent).toBe('11');
+			await act(() => {});
+			expect(r.find('#optimistic').textContent).toBe('1');
+
+			await act(async () => {
+				detail.resolve();
+			});
+			expect(r.find('#detail').textContent).toBe('ready');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('idle');
+		} finally {
+			save.resolve();
+			detail.resolve();
+			await act(() => {});
+			r.unmount();
+			setTransitionFallbackTimeout(previousTimeout);
+			vi.useRealTimers();
 		}
 	});
 
