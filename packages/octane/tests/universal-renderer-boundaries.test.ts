@@ -66,9 +66,10 @@ function objectRoot() {
 function compiledPendingBoundary(dev: boolean, id: string) {
 	return loadCompiledFixtureSource(
 		`import { use } from 'octane';
-export function Scene(props: { wait: Promise<string> }) @{
-	@try { const value = use(props.wait); <label value={value} /> }
-	@pending { <label value="pending" /> }
+export function Scene(props: { wait: Promise<string>; gate?: Promise<void>; title?: string }) @{
+	if (props.gate) use(props.gate);
+	@try { const value = use(props.wait); <label value={value} title={props.title} /> }
+	@pending { <label value="pending" title={props.title} /> }
 }`,
 		{
 			id,
@@ -86,6 +87,14 @@ export function Scene(props: { wait: Promise<string> }) @{
 			runtimeModules: { 'octane/universal': UniversalRuntime },
 		},
 	);
+}
+
+// A retry resubscribed to an already-observed settlement waits one macrotask.
+async function settleRetries(): Promise<void> {
+	for (let turn = 0; turn < 2; turn++) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		for (let index = 0; index < 20; index++) await Promise.resolve();
+	}
 }
 
 function controlledObjectRoot() {
@@ -704,7 +713,7 @@ describe('compiler-owned renderer child regions', () => {
 				await wait;
 				for (let index = 0; index < 20; index++) await Promise.resolve();
 				if (abortTiming === 'after') prepared!.abort();
-				for (let index = 0; index < 20; index++) await Promise.resolve();
+				await settleRetries();
 				expect(container.children.map((child) => child.props.value)).toEqual(['ready']);
 			} finally {
 				root.unmount();
@@ -743,6 +752,129 @@ describe('compiler-owned renderer child regions', () => {
 			root.unmount();
 		}
 	});
+
+	it('keeps a committed pending boundary retry with an attempt that outlives a rejected successor', async () => {
+		const { container, root } = objectRoot();
+		let resolveWait!: (value: string) => void;
+		const wait = new Promise<string>((resolve) => {
+			resolveWait = resolve;
+		});
+		const { Scene } = compiledPendingBoundary(
+			false,
+			'/src/universal-surviving-pending-replay.tsrx',
+		);
+		const plan = universalPlan('other', { kind: 'host', type: 'node' });
+		const Wrong = defineUniversalComponent('other', () => universalValue(plan));
+
+		try {
+			root.render(Scene, { wait });
+			const prepared = root.prepare(Scene, { wait });
+			expect(() => root.prepare(Wrong, undefined)).toThrow(/cannot render component "other"/);
+			expect(prepared.status).toBe('prepared');
+			prepared.abort();
+			resolveWait('ready');
+			await wait;
+			for (let index = 0; index < 20; index++) await Promise.resolve();
+			expect(container.children.map((child) => child.props.value)).toEqual(['ready']);
+		} finally {
+			root.unmount();
+		}
+	});
+
+	it.each([
+		['development commit', true, 'commit'],
+		['production commit', false, 'commit'],
+		['development abort', true, 'abort'],
+		['production abort', false, 'abort'],
+	] as const)(
+		'hands a committed pending boundary retry to a successor attempt (%s)',
+		async (_case, dev, outcome) => {
+			const { container, root } = objectRoot();
+			let resolveWait!: (value: string) => void;
+			const wait = new Promise<string>((resolve) => {
+				resolveWait = resolve;
+			});
+			const { Scene } = compiledPendingBoundary(
+				dev,
+				'/src/universal-superseded-pending-replay.tsrx',
+			);
+
+			try {
+				root.render(Scene, { wait });
+				root.prepare(Scene, { wait });
+				const successor = root.prepare(Scene, { wait });
+
+				resolveWait('ready');
+				await wait;
+				for (let index = 0; index < 20; index++) await Promise.resolve();
+				// The settled retry must not discard the host-held successor.
+				expect(successor.status).toBe('prepared');
+				expect(container.children.map((child) => child.props.value)).toEqual(['pending']);
+
+				if (outcome === 'commit') successor.commit();
+				else successor.abort();
+				await settleRetries();
+				expect(container.children.map((child) => child.props.value)).toEqual(['ready']);
+			} finally {
+				root.unmount();
+			}
+		},
+	);
+
+	it.each([
+		['development abort', true, 'abort'],
+		['production abort', false, 'abort'],
+		['development abort after retry', true, 'abort after retry'],
+		['production abort after retry', false, 'abort after retry'],
+	] as const)(
+		'restores a committed pending boundary retry only while a suspended attempt is live (%s)',
+		async (_case, dev, outcome) => {
+			const { container, root } = objectRoot();
+			let resolveWait!: (value: string) => void;
+			const wait = new Promise<string>((resolve) => {
+				resolveWait = resolve;
+			});
+			let resolveGate!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				resolveGate = resolve;
+			});
+			const { Scene } = compiledPendingBoundary(
+				dev,
+				'/src/universal-suspended-pending-replay.tsrx',
+			);
+			const labels = () =>
+				container.children.map((child) => `${child.props.title}:${child.props.value}`);
+
+			try {
+				root.render(Scene, { wait, title: 'first' });
+				const attempt = root.prepare(Scene, { wait, gate, title: 'second' });
+				expect(attempt.status).toBe('suspended');
+
+				if (outcome === 'abort') {
+					attempt.abort();
+					resolveWait('ready');
+					await wait;
+					for (let index = 0; index < 20; index++) await Promise.resolve();
+					expect(labels()).toEqual(['first:ready']);
+					return;
+				}
+
+				resolveGate();
+				await gate;
+				for (let index = 0; index < 20; index++) await Promise.resolve();
+				resolveWait('ready');
+				await wait;
+				for (let index = 0; index < 20; index++) await Promise.resolve();
+				expect(labels()).toEqual(['second:ready']);
+				// Its retry already committed, so a late abort must not replay the older input.
+				attempt.abort();
+				await settleRetries();
+				expect(labels()).toEqual(['second:ready']);
+			} finally {
+				root.unmount();
+			}
+		},
+	);
 
 	it.each(['commit', 'unmount'] as const)(
 		'keeps a projected retry private until its delayed %s',

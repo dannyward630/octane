@@ -2,5 +2,6 @@
 'octane': patch
 ---
 
-Restore a local Suspense replay when a replacement universal transaction is
-aborted or host preparation fails.
+Keep a committed universal `@pending` boundary retrying when a replacement
+attempt is aborted or its host preparation fails. A later `prepare()` takes
+over that retry instead of letting it discard the newer attempt.
