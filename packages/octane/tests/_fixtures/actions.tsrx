@@ -9,6 +9,7 @@ import {
 	Suspense,
 	startTransition,
 	useTransition,
+	use,
 } from 'octane';
 
 // useActionState wired to <form action={formAction}>. The action receives
@@ -345,6 +346,53 @@ export function SuspendedTransitionRoot(props: { read: () => string }) @{
 		<Suspense fallback={<span id="fallback">{'loading'}</span>}>
 			<OptimisticDetails version={version} read={props.read} />
 		</Suspense>
+	</section>
+}
+
+// An urgent update supersedes a held transition while the boundary renders,
+// finishing the batch that owns the parent's optimistic update mid-render.
+export function OptimisticSupersededTransition(props: {
+	initial: Promise<string>;
+	next: Promise<string>;
+	urgent: Promise<string>;
+}) @{
+	const [optimistic, add] = useOptimistic(0, (state: number, delta: number) => state + delta);
+	<div>
+		<output id="optimistic">{String(optimistic) as string}</output>
+		<SupersededValue {...props} add={add} />
+	</div>
+}
+
+function SupersededValue(props: {
+	initial: Promise<string>;
+	next: Promise<string>;
+	urgent: Promise<string>;
+	add: (delta: number) => void;
+}) @{
+	const [promise, setPromise] = useState(props.initial);
+	const [pending, start] = useTransition();
+	<section>
+		<button
+			id="transition"
+			onClick={() =>
+				start(() => {
+					props.add(1);
+					setPromise(props.next);
+				})
+			}
+		>
+			{'transition'}
+		</button>
+		<button id="urgent" onClick={() => setPromise(props.urgent)}>
+			{'urgent'}
+		</button>
+		<output id="pending">{(pending ? 'pending' : 'idle') as string}</output>
+		@try {
+			const value = use(promise);
+			<span id="value">{value as string}</span>
+		} @pending {
+			<span id="fallback">{'loading'}</span>
+		}
 	</section>
 }
 

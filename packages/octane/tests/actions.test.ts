@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mount, flushEffects } from './_helpers';
+import { act, mount, flushEffects } from './_helpers';
 import { flushSync, setFormAction, startTransition } from '../src/index.js';
 import {
 	ActionForm,
@@ -21,6 +21,7 @@ import {
 	OptimisticCounter,
 	OptimisticSuspenseAction,
 	SuspendedTransitionRoot,
+	OptimisticSupersededTransition,
 	DirectAction,
 	ExposedDispatch,
 	RawForm,
@@ -755,6 +756,43 @@ describe('useOptimistic', () => {
 			await settle();
 			r.unmount();
 			unrelated.unmount();
+		}
+	});
+
+	it('reverts without a cross-render warning when an urgent update supersedes its transition', async () => {
+		const fulfilled = (value: string) =>
+			Object.assign(Promise.resolve(value), { status: 'fulfilled', value });
+		const next = deferred<string>();
+		const r = mount(OptimisticSupersededTransition, {
+			initial: fulfilled('A'),
+			next: next.promise,
+			urgent: fulfilled('C'),
+		});
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			flushSync(() => (r.find('#transition') as HTMLButtonElement).click());
+			await settle();
+			expect(r.find('#value').textContent).toBe('A');
+			expect(r.find('#optimistic').textContent).toBe('1');
+			expect(r.find('#pending').textContent).toBe('pending');
+
+			flushSync(() => (r.find('#urgent') as HTMLButtonElement).click());
+			await settle();
+			expect(r.find('#value').textContent).toBe('C');
+			// The superseded transition's retry finishes its batch in a task.
+			await act(() => {});
+			expect(r.find('#optimistic').textContent).toBe('0');
+			expect(r.find('#pending').textContent).toBe('idle');
+			expect(
+				error.mock.calls.filter(([message]) =>
+					String(message).includes('Cannot update a component'),
+				),
+			).toEqual([]);
+		} finally {
+			error.mockRestore();
+			next.resolve('B');
+			await settle();
+			r.unmount();
 		}
 	});
 

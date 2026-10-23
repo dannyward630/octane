@@ -728,8 +728,8 @@ let DEFERRED_SPAWN = false;
 /**
  * Outstanding transition WORK count — incremented when startTransition fires,
  * decremented when its renders commit (and again for any tryBlock that holds
- * the transition pending while suspended). Optimistic lifetimes subscribe to
- * this global count; useTransition tracks only its hook-owned Action batches.
+ * the transition pending while suspended). Devtools reports it; useTransition
+ * and useOptimistic track their own Action batches instead.
  */
 export let TRANSITION_PENDING_COUNT = 0;
 /**
@@ -806,6 +806,16 @@ export function unsuspendTransitionHolder(holder: object): void {
 // publishes while another component is rendering, its scheduled refresh must
 // not be diagnosed as a userland cross-component render update.
 let TRANSITION_HOOK_PUBLISH_DEPTH = 0;
+
+/** Schedule a hook's urgent publication; its batch may finish while a boundary renders. */
+export function scheduleHookPublication(block: Block): void {
+	TRANSITION_HOOK_PUBLISH_DEPTH++;
+	try {
+		scheduleUrgentRender(block);
+	} finally {
+		TRANSITION_HOOK_PUBLISH_DEPTH--;
+	}
+}
 
 /** The scheduled Block drainQueue is rendering, while transitions are in use. */
 export let TRANSITION_ORIGIN: Block | null = null;
