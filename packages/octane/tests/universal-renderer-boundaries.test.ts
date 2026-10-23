@@ -782,6 +782,44 @@ describe('compiler-owned renderer child regions', () => {
 	});
 
 	it.each([
+		['abort', false, 'abort'],
+		['abort while superseding', true, 'abort'],
+		['commit', false, 'commit'],
+	] as const)(
+		'keeps a committed pending boundary retry across a different component attempt (%s)',
+		async (_case, superseding, outcome) => {
+			const { container, root } = objectRoot();
+			let resolveWait!: (value: string) => void;
+			const wait = new Promise<string>((resolve) => {
+				resolveWait = resolve;
+			});
+			const { Scene } = compiledPendingBoundary(
+				false,
+				'/src/universal-replaced-pending-replay.tsrx',
+			);
+			const plan = universalPlan('object', { kind: 'host', type: 'other' });
+			const Other = defineUniversalComponent('object', () => universalValue(plan));
+
+			try {
+				root.render(Scene, { wait });
+				if (superseding) root.prepare(Scene, { wait });
+				const replacement = root.prepare(Other, undefined);
+				expect(replacement.status).toBe('prepared');
+				if (outcome === 'commit') replacement.commit();
+				else replacement.abort();
+				resolveWait('ready');
+				await wait;
+				await settleRetries();
+				expect(container.children.map((child) => child.props.value ?? child.type)).toEqual(
+					outcome === 'commit' ? ['other'] : ['ready'],
+				);
+			} finally {
+				root.unmount();
+			}
+		},
+	);
+
+	it.each([
 		['development commit', true, 'commit'],
 		['production commit', false, 'commit'],
 		['development abort', true, 'abort'],

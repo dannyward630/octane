@@ -1313,7 +1313,7 @@ interface SuspendedMemoReplay {
 	readonly transitionRender: boolean;
 	active: boolean;
 	asyncWorkQueued: boolean;
-	// An absorbed replay can miss its settlement; reviving it resubscribes.
+	// A displaced replay can miss its settlement; reviving it resubscribes.
 	readonly wakeables: readonly PromiseLike<unknown>[];
 }
 
@@ -1519,9 +1519,9 @@ function resumeOnSettle(wakeable: PromiseLike<unknown>, retry: () => void): void
 
 class UniversalSuspendedAttemptImpl implements UniversalSuspendedAttempt {
 	private state: 'suspended' | 'aborted' = 'suspended';
-	// The live replay prepare() absorbed: revived if this attempt is abandoned,
-	// taken over by a successor prepare().
-	absorbedReplay: SuspendedMemoReplay | null = null;
+	// The live replay prepare() cancelled for this attempt: revived if this attempt
+	// is abandoned, taken over by a successor prepare().
+	displacedReplay: SuspendedMemoReplay | null = null;
 
 	constructor(
 		private readonly root: UniversalRootImpl<any, any>,
@@ -9115,7 +9115,7 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 			this.queueReplay(replay);
 			return;
 		}
-		// An absorbed replay can miss its settlement while inactive. Resubscribing
+		// A displaced replay can miss its settlement while inactive. Resubscribing
 		// retries an observed settlement a macrotask later, as any re-suspended
 		// retry does; queueing at once would loop with an owner that aborts every
 		// re-suspension, such as a DOM host boundary projecting a root suspension.
@@ -9125,12 +9125,12 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 		}
 	}
 
-	reviveAbsorbedReplay(
+	reviveDisplacedReplay(
 		attempt: UniversalTransactionImpl<Container, PublicInstance> | UniversalSuspendedAttemptImpl,
 	): void {
-		const replay = attempt.absorbedReplay;
+		const replay = attempt.displacedReplay;
 		if (replay === null) return;
-		attempt.absorbedReplay = null;
+		attempt.displacedReplay = null;
 		this.restoreAbandonedReplay(replay, true);
 	}
 
@@ -9442,20 +9442,16 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 		if (this.owner !== null) visit(this.owner);
 	}
 
-	// A live replay still owns suspended regions that a scoped update or a
-	// retained subtree can leave untouched in this attempt. Hand its memo cache
-	// to the fresh render so that render re-attempts those regions itself;
-	// discarding the replay would drop the only scheduled retry and leave
-	// pending content on screen after its thenables have already settled.
-	private absorbableReplay(component: UniversalComponent<any>): SuspendedMemoReplay | null {
+	// The live replay a fresh attempt cancels. Cancelling a transition replay
+	// requeues its batches instead, so only a local replay needs reviving.
+	private displaceableReplay(): SuspendedMemoReplay | null {
 		const replay =
 			this.awaitingReplay?.active === true
 				? this.awaitingReplay
 				: this.queuedReplay?.active === true
 					? this.queuedReplay
 					: null;
-		if (replay === null || replay.transitionRender || replay.component !== component) return null;
-		return replay;
+		return replay === null || replay.transitionRender ? null : replay;
 	}
 
 	private cancelSuspendedReplays(preserveTransitions = false): void {
@@ -9684,8 +9680,8 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 			if (preserveTransitions) this.requeueTransitionBatches(attempt.transitionBatches);
 			else this.finishTransitionBatches(attempt.transitionBatches);
 			// Only a live attempt or its pending retry still stands in for the
-			// absorbed replay. Once the retry ran, a late abort must not revive it.
-			this.reviveAbsorbedReplay(attempt);
+			// displaced replay. Once the retry ran, a late abort must not revive it.
+			this.reviveDisplacedReplay(attempt);
 			return;
 		}
 		this.rootRetryAttempt = attempt;
@@ -9809,7 +9805,7 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 		target: UniversalOwnerRecord,
 		component: UniversalComponent<any>,
 		props: any,
-	): UniversalPreparedAttempt | null {
+	): UniversalTransactionImpl<Container, PublicInstance> | null {
 		const range = target.range;
 		// Transported and bridged roots stay on the full-root path: their commits
 		// are acknowledged (or invalidated) against a whole-tree version, so a
@@ -10092,21 +10088,25 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 				throw error;
 			}
 		}
-		// A superseded attempt hands its absorbed replay to this one. Reviving it
+		// A superseded attempt hands its displaced replay to this one. Reviving it
 		// when prepareWithReplay() aborts that attempt would leave it live beside
 		// this one, and its settled retry would discard this attempt.
 		const superseded =
 			this.suspended ?? (this.pending instanceof UniversalTransactionImpl ? this.pending : null);
-		const supersededReplay = superseded?.absorbedReplay ?? null;
-		if (superseded !== null) superseded.absorbedReplay = null;
+		const supersededReplay = superseded?.displacedReplay ?? null;
+		if (superseded !== null) superseded.displacedReplay = null;
 		// A fresh attempt invalidates the old replay cache, but its transition
 		// updates remain queued. Non-urgent work consumes every promoted batch in
 		// one ordered rebase; urgent work leaves them scheduled for the next pass.
 		this.suspended?.abort(true);
-		const absorbedReplay =
-			supersededReplay?.component === component
-				? supersededReplay
-				: this.absorbableReplay(component);
+		// A live replay still owns suspended regions that a scoped update or a
+		// retained subtree can leave untouched in this attempt. Hand its memo cache
+		// to a fresh render of the same component so that render re-attempts those
+		// regions itself. Either way the attempt holds the replay and revives it if
+		// abandoned: discarding it would drop the only scheduled retry and leave
+		// pending content on screen after its thenables have already settled.
+		const displacedReplay = supersededReplay ?? this.displaceableReplay();
+		const absorbedReplay = displacedReplay?.component === component ? displacedReplay : null;
 		this.cancelSuspendedReplays(true);
 		const scheduledTransitions = scheduledUrgent
 			? EMPTY_UNIVERSAL_TRANSITION_BATCHES
@@ -10123,7 +10123,10 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 				universalShallowEqual(props, this.lastProps)
 			) {
 				const ownedAttempt = this.prepareOwnedUpdate(ownedTarget, component, props);
-				if (ownedAttempt !== null) return ownedAttempt;
+				if (ownedAttempt !== null) {
+					ownedAttempt.displacedReplay = displacedReplay;
+					return ownedAttempt;
+				}
 			}
 			const attempt = this.prepareWithReplay(
 				component,
@@ -10133,7 +10136,7 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 				!scheduledUrgent && scheduledTransitions.size !== 0,
 				absorbedReplay === null,
 			);
-			attempt.absorbedReplay = absorbedReplay;
+			attempt.displacedReplay = displacedReplay;
 			if (scheduledUrgent && attempt.status === 'suspended') {
 				this.ensureScheduledTransitionWork();
 			}
@@ -10148,8 +10151,8 @@ class UniversalRootImpl<Container, PublicInstance> implements UniversalRoot<any>
 			}
 			// A transaction this attempt could not abort, such as one awaiting
 			// transport acknowledgement, keeps its replay until it ends.
-			if (superseded?.status === 'prepared') superseded.absorbedReplay = supersededReplay;
-			else if (absorbedReplay !== null) this.restoreAbandonedReplay(absorbedReplay, true);
+			if (superseded?.status === 'prepared') superseded.displacedReplay = supersededReplay;
+			else if (displacedReplay !== null) this.restoreAbandonedReplay(displacedReplay, true);
 			throw error;
 		}
 	}
@@ -13597,9 +13600,9 @@ class UniversalBoundHostTransaction<
 
 class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTransaction {
 	private state: 'prepared' | 'committed' | 'aborted' = 'prepared';
-	// The live replay prepare() absorbed: revived if this attempt aborts before
-	// host acceptance, taken over by a successor prepare().
-	absorbedReplay: SuspendedMemoReplay | null = null;
+	// The live replay prepare() cancelled for this attempt: revived if this attempt
+	// aborts before host acceptance, taken over by a successor prepare().
+	displacedReplay: SuspendedMemoReplay | null = null;
 	private hostAccepted = false;
 	private commitStarted = false;
 	private completion: Promise<void> | null = null;
@@ -13640,7 +13643,7 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 		}
 		this.commitStarted = true;
 		this.hostAccepted = true;
-		this.absorbedReplay = null;
+		this.displacedReplay = null;
 		runCommitTasks([
 			this.applyHost,
 			() => this.root.markBatchAccepted(this.batch.version),
@@ -13720,7 +13723,7 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 			}
 			this.root.validateTransportAcknowledgement(message, this.transportIdentity.version);
 			this.hostAccepted = true;
-			this.absorbedReplay = null;
+			this.displacedReplay = null;
 			let hasError = false;
 			let firstError: unknown;
 			try {
@@ -13793,7 +13796,7 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 			try {
 				this.root.finish(this);
 			} finally {
-				this.root.reviveAbsorbedReplay(this);
+				this.root.reviveDisplacedReplay(this);
 			}
 		}
 	}
@@ -13826,7 +13829,7 @@ class UniversalTransactionImpl<Container, PublicInstance> implements UniversalTr
 			try {
 				this.root.finish(this);
 			} finally {
-				this.root.reviveAbsorbedReplay(this);
+				this.root.reviveDisplacedReplay(this);
 			}
 		}
 	}
