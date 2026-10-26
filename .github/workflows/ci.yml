@@ -720,7 +720,7 @@ jobs:
 
       - name: Run Octane iframe focus regression in WebKit
         if: ${{ !cancelled() && steps.install_heavy_node_chromium.outcome == 'success' }}
-        run: node --test packages/octane/tests/browser/iframe-focus-preservation.webkit.test.mjs
+        run: node --test packages/octane/tests/browser/iframe-focus-preservation.webkit.mjs
 
       # Keep each former lane as a named step, and let independent suites run
       # after a sibling failure when their own prerequisites are still valid.
